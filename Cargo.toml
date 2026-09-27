@@ -1,0 +1,19 @@
+[package]
+name = "sintaxer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Deterministic, indexed SINTAX-style amplicon taxonomy classification"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+needletail = { version = "0.7.3", default-features = false, features = ["flate2", "zstd"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

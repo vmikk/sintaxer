@@ -295,12 +295,14 @@ fn main() -> Result<()> {
                 index.verify()?;
             }
             println!(
-                "format=1\nalgorithm={}\nk=8\nreferences={}\ntaxonomy_nodes={}\ndense_rows={}\nbytes={}\nsource_blake3={}\nverified={verify}",
+                "format={}\nalgorithm={}\nk=8\nreferences={}\ntaxonomy_nodes={}\ndense_rows={}\nbytes={}\nsequence_bytes={}\nsource_blake3={}\nverified={verify}",
+                index.format_version(),
                 sintaxer::ALGORITHM_VERSION,
                 index.references,
                 index.nodes,
                 index.dense_rows(),
                 index.file_bytes(),
+                index.sequence_bytes(),
                 index.source_hash()
             );
         }

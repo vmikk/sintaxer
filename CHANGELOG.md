@@ -1,5 +1,12 @@
 # sintaxer changelog
 
+## [0.2.0]
+
+### Changed
+- Index format bumped to 2, which stores packed reference sequences alongside the postings. Rebuild existing indexes, since older ones are rejected with a clear error.
+- `inspect` now prints the format version and the size of the sequence section.
+
+
 ## [0.1.0]
 
 Initial release.

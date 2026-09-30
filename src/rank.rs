@@ -14,8 +14,9 @@ use anyhow::{Result, ensure};
 /// References per tile, sized so the counter planes stay in L1.
 pub const TILE: usize = 4096;
 const LANES: usize = TILE / 64;
-/// A match count can't exceed the query's vocabulary size; 16 planes is enough.
-const PLANE_CAP: usize = 16;
+/// A match count can't exceed the query's vocabulary size, which is capped
+/// just below the word universe, so 17 planes is enough.
+const PLANE_CAP: usize = 17;
 
 /// Marks a word absent from the query in the reverse lookup table.
 const ABSENT: u16 = u16::MAX;
@@ -123,8 +124,10 @@ impl Workspace {
     /// Exact `|W(query) intersect W(r)|` for every reference `r`.
     pub fn rank(&mut self, index: &Index, words: &[u16]) -> Result<()> {
         ensure!(!words.is_empty(), "empty query vocabulary");
+        ensure!(words.len() < ABSENT as usize, "query vocabulary too large");
         let n = index.references;
-        let depth = depth_for(words.len()).min(PLANE_CAP);
+        let depth = depth_for(words.len());
+        debug_assert!(depth <= PLANE_CAP);
         self.counts.clear();
         self.counts.resize(n, 0);
         self.cursors.clear();

@@ -37,7 +37,7 @@ impl Default for Config {
             cutoff: 0.8,
             strand: Strand::Both,
             exact: false,
-            candidates: 1024,
+            candidates: 2048,
             risk: 0.0,
         }
     }
@@ -65,6 +65,8 @@ pub struct Timings {
     pub taxonomy: Duration,
     /// Whether any strand needed a wider candidate set than the default.
     pub escalated: bool,
+    /// Bytes that were neither ACGT nor a recognised ambiguity code.
+    pub unknown_bases: usize,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prediction {
@@ -297,9 +299,10 @@ pub fn classify(
     config.validate()?;
     let mut timings = Timings::default();
     let start = Instant::now();
-    let normalized = sequence::normalize(sequence)?;
+    let (normalized, unknown) = sequence::normalize(sequence);
     rank::vocabulary(&normalized, &mut ws.seen, &mut ws.forward);
     timings.extraction += start.elapsed();
+    timings.unknown_bases += unknown;
     if ws.forward.len() < SAMPLE_SIZE {
         return Ok((Prediction::unclassified(), timings));
     }

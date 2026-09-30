@@ -51,7 +51,7 @@ enum Command {
         exact: bool,
         /// References carried into the replicates; larger is safer and slower.
         /// Small databases (under about four times this) skip ranking entirely.
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 2048)]
         candidates: usize,
         /// Escalate to the exact path when the expected number of replicates a pruned
         /// reference could have tied exceeds this (0 disables). Escalates often on divergent queries.

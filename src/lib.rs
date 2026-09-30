@@ -2,6 +2,7 @@
 pub mod classify;
 pub mod index;
 pub mod input;
+pub mod rank;
 pub mod rng;
 pub mod scoring;
 pub mod sequence;

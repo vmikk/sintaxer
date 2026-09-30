@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use sintaxer::{
+    classify::Workspace,
     classify::{self, Config, Strand, Timings},
     index::{self, Index},
     input,
-    scoring::{Engine, Workspace},
 };
 use std::{
     io::{self, BufWriter, Write},
@@ -46,13 +46,17 @@ enum Command {
         cutoff: f64,
         #[arg(long, value_enum, default_value_t = Strand::Both)]
         strand: Strand,
-        /// Scoring engine; the optimized engines are experimental.
-        #[arg(long, value_enum, default_value_t = Engine::Scalar)]
-        engine: Engine,
+        /// Score every reference in every replicate, as published SINTAX does (slower).
+        #[arg(long)]
+        exact: bool,
+        /// References carried into the replicates; larger is safer and slower.
+        /// Small databases (under about four times this) skip ranking entirely.
         #[arg(long, default_value_t = 1024)]
-        tile_size: usize,
-        #[arg(long, default_value_t = 16)]
-        bootstrap_batch: usize,
+        candidates: usize,
+        /// Escalate to the exact path when the expected number of replicates a pruned
+        /// reference could have tied exceeds this (0 disables). Escalates often on divergent queries.
+        #[arg(long, default_value_t = 0.0)]
+        risk: f64,
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
@@ -76,6 +80,7 @@ struct BatchResult {
     output: String,
     reads: usize,
     bases: usize,
+    escalated: usize,
     timings: Timings,
 }
 
@@ -89,6 +94,7 @@ fn process(
         output: String::new(),
         reads: 0,
         bases: 0,
+        escalated: 0,
         timings: Timings::default(),
     };
     for record in batch {
@@ -99,6 +105,7 @@ fn process(
             .push_str(&prediction.tsv(&record.label, config.cutoff));
         result.reads += 1;
         result.bases += record.sequence.len();
+        result.escalated += usize::from(times.escalated);
         result.timings.extraction += times.extraction;
         result.timings.sampling += times.sampling;
         result.timings.scoring += times.scoring;
@@ -144,7 +151,7 @@ fn run_classify(
         None => Box::new(io::stdout()),
     };
     let mut writer = BufWriter::with_capacity(256 * 1024, sink);
-    let (mut total_reads, mut total_bases) = (0, 0);
+    let (mut total_reads, mut total_bases, mut escalated) = (0usize, 0usize, 0usize);
     let mut totals = Timings::default();
     let (mut parsing, mut writing) = (Duration::ZERO, Duration::ZERO);
     let mut first_result = None;
@@ -227,6 +234,7 @@ fn run_classify(
                     writing += start.elapsed();
                     total_reads += result.reads;
                     total_bases += result.bases;
+                    escalated += result.escalated;
                     totals.extraction += result.timings.extraction;
                     totals.sampling += result.timings.sampling;
                     totals.scoring += result.timings.scoring;
@@ -267,6 +275,16 @@ fn run_classify(
             totals.sampling.as_secs_f64(),
             totals.scoring.as_secs_f64(),
             totals.taxonomy.as_secs_f64()
+        );
+        // Report escalations: when candidate restriction fails, it silently escalates
+        // every query and loses the speedup.
+        eprintln!(
+            "escalated_queries={escalated} escalated_pct={:.3}",
+            if total_reads > 0 {
+                100.0 * escalated as f64 / total_reads as f64
+            } else {
+                0.0
+            }
         );
     }
     Ok(())
@@ -314,9 +332,9 @@ fn main() -> Result<()> {
             seed,
             cutoff,
             strand,
-            engine,
-            tile_size,
-            bootstrap_batch,
+            exact,
+            candidates,
+            risk,
             profile,
         } => {
             run_classify(
@@ -328,9 +346,9 @@ fn main() -> Result<()> {
                     seed,
                     cutoff,
                     strand,
-                    engine,
-                    tile_size,
-                    bootstrap_batch,
+                    exact,
+                    candidates,
+                    risk,
                 },
                 profile,
             )?;

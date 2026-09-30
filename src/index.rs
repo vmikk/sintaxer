@@ -107,6 +107,34 @@ impl Row<'_> {
             }
         }
     }
+    /// Membership bits for a whole tile of references, written into `out`.
+    ///
+    /// `cursor` must start at zero and is carried across calls with ascending
+    /// `start`, making sparse rows O(1) amortised per tile instead of a binary search.
+    pub fn tile_bits(&self, start: usize, out: &mut [u64], cursor: &mut usize) {
+        out.fill(0);
+        let end = start + out.len() * 64;
+        if self.dense {
+            for (lane, slot) in out.iter_mut().enumerate() {
+                *slot = self.bits64(start + lane * 64);
+            }
+            return;
+        }
+        // Postings are strictly increasing, so a stale cursor can only point before
+        // the tile: skip forward, then emit until past its end.
+        while *cursor < self.count && self.id(*cursor) < start {
+            *cursor += 1;
+        }
+        while *cursor < self.count {
+            let id = self.id(*cursor);
+            if id >= end {
+                break;
+            }
+            out[(id - start) / 64] |= 1 << ((id - start) % 64);
+            *cursor += 1;
+        }
+    }
+
     /// Membership bits for 64 references; `start` must be a multiple of 64.
     pub fn bits64(&self, start: usize) -> u64 {
         debug_assert_eq!(start % 64, 0);
@@ -363,6 +391,31 @@ impl Index {
             "truncated packed sequence"
         );
         Ok((bases, &record[8..positions], packed))
+    }
+
+    /// Every k-mer of one reference, in sequence order, duplicates included.
+    ///
+    /// Not deduplicated: callers only set membership bits, which is idempotent.
+    pub fn visit_kmers(&self, reference: usize, mut visit: impl FnMut(u16)) -> Result<()> {
+        let (bases, ambiguous, packed) = self.record(reference)?;
+        let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
+        let mut next_break = breaks.next().unwrap_or(usize::MAX);
+        let (mut word, mut run) = (0u16, 0usize);
+        for position in 0..bases as usize {
+            if position == next_break {
+                word = 0;
+                run = 0;
+                next_break = breaks.next().unwrap_or(usize::MAX);
+                continue;
+            }
+            let code = (packed[position / 4] >> ((position % 4) * 2)) & 3;
+            word = (word << 2) | u16::from(code);
+            run = (run + 1).min(K);
+            if run == K {
+                visit(word);
+            }
+        }
+        Ok(())
     }
 
     /// Distinct k-mers of one reference, in ascending order, via `visit`.

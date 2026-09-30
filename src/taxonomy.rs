@@ -13,9 +13,13 @@ pub fn parse(header: &str) -> Result<Lineage> {
     let mut lineage: Lineage = Default::default();
     let mut previous = None;
     for item in tax.split(',') {
+        // Skip empty fields from trailing or doubled commas.
+        if item.is_empty() {
+            continue;
+        }
         let bytes = item.as_bytes();
         ensure!(
-            bytes.len() >= 3 && bytes[1] == b':',
+            bytes.len() >= 2 && bytes[1] == b':',
             "invalid rank annotation {item:?}"
         );
         let rank = b"dkpcofgst"
@@ -29,10 +33,11 @@ pub fn parse(header: &str) -> Result<Lineage> {
         previous = Some(rank);
         let name = &item[2..];
         ensure!(
-            !name.trim().is_empty() && !name.chars().any(char::is_control),
-            "empty or invalid taxon name"
+            !name.chars().any(char::is_control),
+            "invalid taxon name {name:?}"
         );
-        if rank < 7 {
+        // `c:` means the class is unknown; treat it as a missing rank, not an error.
+        if rank < 7 && !name.trim().is_empty() {
             lineage[rank] = Some(name.to_owned());
         }
     }

@@ -582,6 +582,7 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         ));
     }
     let mut counts = vec![0u32; WORDS];
+    let (mut unknown_bases, mut unknown_records) = (0usize, 0usize);
     // Packed sequences are staged to disk alongside the incidence buckets.
     let mut sequences =
         BufWriter::with_capacity(1024 * 1024, File::create(tempdir.path().join("sequences"))?);
@@ -600,8 +601,9 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         );
         let label = input::label(record.id())?;
         let tax = crate::taxonomy::parse(&label).with_context(|| format!("reference {label:?}"))?;
-        let seq =
-            sequence::normalize(&record.seq()).with_context(|| format!("reference {label:?}"))?;
+        let (seq, unknown) = sequence::normalize(&record.seq());
+        unknown_bases += unknown;
+        unknown_records += usize::from(unknown > 0);
         let words = sequence::unique_words(&seq);
         let id = u32::try_from(leaves.len()).context("too many reference sequences")?;
         ensure!(id < u32::MAX, "reference count exceeds format limit");
@@ -624,6 +626,12 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     sequences.flush()?;
     drop(sequences);
     ensure!(!leaves.is_empty(), "empty reference database");
+    if unknown_bases > 0 {
+        eprintln!(
+            "warning: {unknown_bases} unrecognised sequence bytes in {unknown_records} references \
+             treated as ambiguous"
+        );
+    }
     for b in &mut buckets {
         b.flush()?;
     }

@@ -1,19 +1,24 @@
 use crate::{K, WORDS};
-use anyhow::{Result, bail};
 
-pub fn normalize(sequence: &[u8]) -> Result<Vec<u8>> {
-    sequence
+/// Uppercase, convert RNA to DNA, and turn any other byte into `N`.
+///
+/// Non-ACGT bytes just break the k-mer window. Unknown bytes are counted
+/// so the caller can report them instead of failing the build.
+pub fn normalize(sequence: &[u8]) -> (Vec<u8>, usize) {
+    let mut unknown = 0;
+    let out = sequence
         .iter()
-        .enumerate()
-        .map(|(i, &b)| {
-            let b = b.to_ascii_uppercase();
-            match b {
-                b'A' | b'C' | b'G' | b'T' | b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B'
-                | b'D' | b'H' | b'V' | b'N' => Ok(b),
-                _ => bail!("invalid nucleotide byte 0x{b:02x} at position {}", i + 1),
+        .map(|&b| match b.to_ascii_uppercase() {
+            b'A' | b'C' | b'G' | b'T' | b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B' | b'D'
+            | b'H' | b'V' | b'N' => b.to_ascii_uppercase(),
+            b'U' => b'T',
+            _ => {
+                unknown += 1;
+                b'N'
             }
         })
-        .collect()
+        .collect();
+    (out, unknown)
 }
 
 /// Distinct two-bit-encoded words, ascending; ambiguous bases reset the window.

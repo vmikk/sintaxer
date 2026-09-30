@@ -1,9 +1,8 @@
 use crate::{
-    BOOTSTRAPS, SAMPLE_SIZE,
+    BOOTSTRAPS, SAMPLE_SIZE, WORDS,
     index::Index,
-    rng,
-    scoring::{self, Engine, Sample, Workspace},
-    sequence,
+    rank::{self, Bound},
+    rng, scoring, sequence,
     taxonomy::RANKS,
 };
 use anyhow::{Result, ensure};
@@ -23,9 +22,13 @@ pub struct Config {
     pub seed: u64,
     pub cutoff: f64,
     pub strand: Strand,
-    pub engine: Engine,
-    pub tile_size: usize,
-    pub bootstrap_batch: usize,
+    /// Score every reference in every replicate, as published SINTAX does. Slow; used to check the fast path.
+    pub exact: bool,
+    /// Size the candidate set is grown to before the replicates run.
+    pub candidates: usize,
+    /// Largest tolerated expected number of pruned references that could have won a
+    /// replicate. Exceeding it widens the candidate set.
+    pub risk: f64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -33,9 +36,9 @@ impl Default for Config {
             seed: 1,
             cutoff: 0.8,
             strand: Strand::Both,
-            engine: Engine::Scalar,
-            tile_size: 1024,
-            bootstrap_batch: 16,
+            exact: false,
+            candidates: 1024,
+            risk: 0.0,
         }
     }
 }
@@ -45,17 +48,10 @@ impl Config {
             self.cutoff.is_finite() && (0.0..=1.0).contains(&self.cutoff),
             "cutoff must be finite and in [0,1]"
         );
+        ensure!(self.candidates > 0, "candidate target must be positive");
         ensure!(
-            [256, 1024, 4096].contains(&self.tile_size),
-            "invalid tile size"
-        );
-        ensure!(
-            [8, 16, 32].contains(&self.bootstrap_batch),
-            "invalid bootstrap batch"
-        );
-        ensure!(
-            self.engine != Engine::Avx2 || scoring::avx2_available(),
-            "AVX2 unavailable"
+            self.risk.is_finite() && self.risk >= 0.0,
+            "risk tolerance must be finite and non-negative"
         );
         Ok(())
     }
@@ -67,6 +63,8 @@ pub struct Timings {
     pub sampling: Duration,
     pub scoring: Duration,
     pub taxonomy: Duration,
+    /// Whether any strand needed a wider candidate set than the default.
+    pub escalated: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prediction {
@@ -101,13 +99,45 @@ impl Prediction {
     }
 }
 
-pub fn samples(words: &[u16], key: &blake3::Hash, strand: u8) -> Vec<Sample> {
+/// Per-worker scratch, reused across queries.
+pub struct Workspace {
+    rank: rank::Workspace,
+    scores: Vec<u8>,
+    forward: Vec<u16>,
+    reverse: Vec<u16>,
+    seen: Box<[u64; WORDS / 64]>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            rank: rank::Workspace::default(),
+            scores: Vec::new(),
+            forward: Vec::new(),
+            reverse: Vec::new(),
+            seen: Box::new([0; WORDS / 64]),
+        }
+    }
+}
+
+/// Positions drawn from the query vocabulary, with replacement.
+///
+/// Positions rather than word codes, so the exact and candidate paths consume the
+/// RNG identically and stay comparable.
+pub fn samples(vocabulary: usize, key: &blake3::Hash, strand: u8) -> Vec<[u16; SAMPLE_SIZE]> {
     (0..BOOTSTRAPS)
         .map(|boot| {
             let mut rng = rng::stream(key, strand, boot, 0);
-            std::array::from_fn(|_| words[rng.bounded(words.len() as u64) as usize])
+            std::array::from_fn(|_| rng.bounded(vocabulary as u64) as u16)
         })
         .collect()
+}
+
+/// One strand's replicate outcomes.
+struct Outcome {
+    max: u8,
+    winners: Vec<u32>,
+    escalated: bool,
 }
 
 pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
@@ -152,6 +182,112 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
     }
 }
 
+/// Every replicate scored against the whole database, as published SINTAX does.
+fn exact_tops(
+    index: &Index,
+    words: &[u16],
+    samples: &[[u16; SAMPLE_SIZE]],
+    ws: &mut Workspace,
+) -> Result<Vec<scoring::Top>> {
+    let mut tops = Vec::with_capacity(BOOTSTRAPS);
+    for sample in samples {
+        let codes: [u16; SAMPLE_SIZE] = std::array::from_fn(|i| words[sample[i] as usize]);
+        scoring::scalar_scores(index, &codes, &mut ws.scores)?;
+        tops.push(scoring::Top::from_scores(&ws.scores));
+    }
+    Ok(tops)
+}
+
+/// Expected number of replicates whose winner could have differed had the pruned
+/// references been scored.
+fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabulary: usize) -> f64 {
+    let mut cache = [f64::NAN; SAMPLE_SIZE + 1];
+    let mut risk = 0.0;
+    for top in tops {
+        // Scores below two are never recorded, so that is the floor a pruned reference must reach.
+        let score = top.score.max(2) as usize;
+        if cache[score].is_nan() {
+            cache[score] = Bound::new(histogram, threshold, vocabulary, score as u8).risk();
+        }
+        risk += cache[score];
+    }
+    risk
+}
+
+/// Score every replicate of one strand, exactly or against candidates.
+fn score_strand(
+    index: &Index,
+    words: &[u16],
+    samples: &[[u16; SAMPLE_SIZE]],
+    key: &blake3::Hash,
+    strand: u8,
+    config: &Config,
+    ws: &mut Workspace,
+) -> Result<Outcome> {
+    let mut escalated = false;
+    // With a candidate set that is a large share of the database, the rank pass and
+    // projection cost more than scoring everything, so small databases go exact.
+    let worth_it = !config.exact && index.references > config.candidates.saturating_mul(4);
+    let mut from_candidates = worth_it;
+    let mut tops = if !worth_it {
+        exact_tops(index, words, samples, ws)?
+    } else {
+        ws.rank.rank(index, words)?;
+        // Widen the candidate set a couple of times at most, then fall back to the exact
+        // path. Worst case is one rank pass plus one exact scan.
+        let ceiling = config.candidates.saturating_mul(64).min(index.references);
+        let mut target = config.candidates;
+        loop {
+            let threshold = ws.rank.select(target);
+            ws.rank.project(index, words)?;
+            let mut tops = Vec::with_capacity(BOOTSTRAPS);
+            for sample in samples {
+                tops.push(ws.rank.replicate(sample));
+            }
+            // Ties can push the set far past its target, making projection dearer than an exact
+            // scan; a threshold no candidate exceeds means the rank pass separated nothing.
+            let oversized = ws.rank.candidates.len() * 2 >= index.references;
+            let unseparated = ws
+                .rank
+                .candidates
+                .iter()
+                .all(|&r| ws.rank.counts[r as usize] <= threshold);
+            let risky = config.risk > 0.0
+                && strand_risk(&tops, &ws.rank.histogram, threshold, words.len()) > config.risk;
+            if !oversized && !unseparated && !risky {
+                break tops;
+            }
+            escalated = true;
+            if oversized || unseparated || target >= ceiling || threshold <= 1 {
+                from_candidates = false;
+                break exact_tops(index, words, samples, ws)?;
+            }
+            target = target.saturating_mul(8).min(ceiling);
+        }
+    };
+    tops.truncate(BOOTSTRAPS);
+
+    let mut max = 0;
+    let mut winners = Vec::with_capacity(BOOTSTRAPS);
+    for (boot, top) in tops.iter().enumerate() {
+        max = max.max(top.score);
+        if top.score >= 2 {
+            let mut ties = rng::stream(key, strand, boot, 1);
+            let offset = ties.bounded(top.count as u64) as usize;
+            winners.push(if from_candidates {
+                ws.rank.reference_at(top, offset)
+            } else {
+                top.nth(offset)
+            });
+        }
+    }
+    Ok(Outcome {
+        max,
+        winners,
+        escalated,
+    })
+}
+
 pub fn classify(
     index: &Index,
     sequence: &[u8],
@@ -162,47 +298,50 @@ pub fn classify(
     let mut timings = Timings::default();
     let start = Instant::now();
     let normalized = sequence::normalize(sequence)?;
-    let forward = sequence::unique_words(&normalized);
+    rank::vocabulary(&normalized, &mut ws.seen, &mut ws.forward);
     timings.extraction += start.elapsed();
-    if forward.len() < SAMPLE_SIZE {
+    if ws.forward.len() < SAMPLE_SIZE {
         return Ok((Prediction::unclassified(), timings));
     }
     let key = rng::query_key(config.seed, &normalized);
     let mut best: Option<(u8, Vec<u32>, char)> = None;
     for strand in 0..if config.strand == Strand::Both { 2 } else { 1 } {
         let start = Instant::now();
-        let words = if strand == 0 {
-            forward.clone()
-        } else {
-            sequence::unique_words(&sequence::reverse_complement(&normalized))
-        };
+        if strand == 1 {
+            let forward = std::mem::take(&mut ws.forward);
+            rank::revcomp_vocabulary(&forward, &mut ws.seen, &mut ws.reverse);
+            ws.forward = forward;
+        }
         timings.extraction += start.elapsed();
+        let words = if strand == 0 {
+            std::mem::take(&mut ws.forward)
+        } else {
+            std::mem::take(&mut ws.reverse)
+        };
+
         let start = Instant::now();
-        let samples = samples(&words, &key, strand);
+        let samples = samples(words.len(), &key, strand);
         timings.sampling += start.elapsed();
-        let (mut max, mut winners) = (0, Vec::with_capacity(BOOTSTRAPS));
+
         let start = Instant::now();
-        scoring::score_bootstraps(
-            index,
-            &samples,
-            config.engine,
-            config.tile_size,
-            config.bootstrap_batch,
-            ws,
-            |boot, top| {
-                max = max.max(top.score);
-                if top.score >= 2 {
-                    let mut ties = rng::stream(&key, strand, boot, 1);
-                    winners.push(top.nth(ties.bounded(top.count as u64) as usize));
-                }
-            },
-        )?;
+        let outcome = score_strand(index, &words, &samples, &key, strand, config, ws);
         timings.scoring += start.elapsed();
-        if best
-            .as_ref()
-            .is_none_or(|(score, hits, _)| (max, winners.len()) > (*score, hits.len()))
-        {
-            best = Some((max, winners, if strand == 0 { '+' } else { '-' }));
+        if strand == 0 {
+            ws.forward = words;
+        } else {
+            ws.reverse = words;
+        }
+        let outcome = outcome?;
+        timings.escalated |= outcome.escalated;
+
+        if best.as_ref().is_none_or(|(score, hits, _)| {
+            (outcome.max, outcome.winners.len()) > (*score, hits.len())
+        }) {
+            best = Some((
+                outcome.max,
+                outcome.winners,
+                if strand == 0 { '+' } else { '-' },
+            ));
         }
     }
     let (_, winners, strand) = best.unwrap();

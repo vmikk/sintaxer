@@ -1,6 +1,20 @@
 # sintaxer changelog
 
-## [0.2.0]
+## [0.3.0]
+
+### Added
+- `--exact` runs the published every-reference, every-replicate algorithm, for checking the fast path.
+- `--risk`, an opt-in conservative mode that escalates to a wider candidate set. `--profile` reports how often escalation happened.
+
+### Changed
+- Classification ranks every reference against the whole query vocabulary once per strand, then runs the bootstrap replicates only on the top `--candidates` (default 1024). Small databases skip the ranking.
+
+### Removed
+- The experimental `--engine`, `--tile-size` and `--bootstrap-batch` options.
+
+### Performance
+- Much faster on large databases, and the advantage grows with database size.
+
 
 ### Changed
 - Index format bumped to 2, which stores packed reference sequences alongside the postings. Rebuild existing indexes, since older ones are rejected with a clear error.

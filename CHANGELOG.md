@@ -1,4 +1,13 @@
-# sintaxer changelog
+
+## [0.4.0]
+
+### Changed
+- Default `--candidates` raised from 1024 to 2048.
+- Unrecognised sequence bytes are now treated as `N` rather than rejected, and `U` is read as `T`. `index` warns with a count.
+
+### Fixed
+- Trailing or doubled commas in `tax=` annotations, and empty rank names such as `c:`, no longer abort index builds.
+- Queries whose vocabulary covers almost the whole 8-mer space no longer overflow the rank counters.
 
 ## [0.3.0]
 

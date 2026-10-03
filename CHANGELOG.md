@@ -1,4 +1,11 @@
 
+## [0.5.0]
+
+### Added
+- New `curate` subcommand that subsamples a redundant reference FASTA to at most `--cap` representatives (default 1000) per distinct lineage while keeping every rank name.
+- `curate --plan` surveys the database and reports saturation hazards and a cap curve without writing anything. Real runs write a JSON provenance manifest next to the output.
+- Curation options include `--select random|maxmin|first`, length demotion (`--demote-length`, `--max-length`), shallow-lineage caps and `--oversize-list`.
+
 ## [0.4.0]
 
 ### Changed

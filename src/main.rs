@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use sintaxer::{
     classify::Workspace,
     classify::{self, Config, Strand, Timings},
+    curate,
     index::{self, Index},
     input,
 };
@@ -60,6 +61,59 @@ enum Command {
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
+    },
+    /// Survey a reference database and report what curation would do to it.
+    Curate {
+        reference: PathBuf,
+        /// Survey and report only; write no curated FASTA.
+        #[arg(long)]
+        plan: bool,
+        /// Curated FASTA to write. Required unless --plan.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Provenance manifest. Defaults to <output>.curation.json.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// How representatives are chosen once a group exceeds the cap.
+        #[arg(long, value_enum, default_value_t = curate::Selector::Random)]
+        select: curate::Selector,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Representatives to keep per distinct stored lineage. Lower is faster
+        /// and less sensitive.
+        #[arg(long, default_value_t = 1000)]
+        cap: usize,
+        /// Soft length threshold: flags a reference as a saturation hazard and
+        /// sorts it last among candidates, but never drops it.
+        #[arg(long, default_value_t = 2000)]
+        demote_length: usize,
+        /// Hard length ceiling. Off by default, since on an untrimmed database it
+        /// can delete whole genera.
+        #[arg(long)]
+        max_length: Option<usize>,
+        #[arg(long, default_value_t = 0.10)]
+        max_ambiguity: f64,
+        #[arg(long, default_value_t = 32)]
+        min_words: usize,
+        /// Sketch distance past which candidates count as equally diverse.
+        #[arg(long, default_value_t = curate::DIVERSITY_CEILING)]
+        ceiling: f32,
+        /// Caps for records with neither family nor genus, as
+        /// covered,orphan-order,unplaced. Capped rather than dropped to guard against over-classification.
+        #[arg(long, default_value = "50,50,50", value_delimiter = ',')]
+        shallow_cap: Vec<usize>,
+        /// Also cap covered shallow groups relative to their annotated siblings.
+        #[arg(long, default_value_t = 0.10)]
+        shallow_ratio: f64,
+        /// Drop every under-annotated record. For validation only, not production use.
+        #[arg(long)]
+        drop_shallow: bool,
+        /// Drop organellar and spike-in decoys. For validation only.
+        #[arg(long)]
+        drop_organellar: bool,
+        /// Write every label longer than --demote-length here, as a trimming worklist.
+        #[arg(long)]
+        oversize_list: Option<PathBuf>,
     },
     /// Read metadata, optionally verifying the entire index.
     Inspect {
@@ -306,6 +360,155 @@ fn main() -> Result<()> {
                 output.display(),
                 start.elapsed().as_secs_f64()
             );
+        }
+        Command::Curate {
+            reference,
+            plan,
+            output,
+            report,
+            select,
+            seed,
+            cap,
+            demote_length,
+            max_length,
+            max_ambiguity,
+            min_words,
+            ceiling,
+            shallow_cap,
+            shallow_ratio,
+            drop_shallow,
+            drop_organellar,
+            oversize_list,
+        } => {
+            // Curation reads the input twice, so it cannot take a stream.
+            ensure!(
+                reference.as_os_str() != "-",
+                "curate needs a seekable reference file, not stdin"
+            );
+            ensure!(
+                plan != output.is_some(),
+                "pass either --output <fasta> or --plan, not both"
+            );
+            if let (Some(output), true) = (output.as_deref(), reference.exists()) {
+                if output.exists() {
+                    ensure!(
+                        std::fs::canonicalize(&reference)? != std::fs::canonicalize(output)?,
+                        "curated output must differ from reference input"
+                    );
+                }
+            }
+            ensure!(cap > 0, "cap must be at least 1");
+            ensure!(
+                shallow_cap.len() == 3 && shallow_cap.iter().all(|&c| c > 0),
+                "shallow-cap takes three positive values: covered,orphan-order,unplaced"
+            );
+            ensure!(
+                (0.0..=1.0).contains(&shallow_ratio),
+                "shallow-ratio must be in 0..=1"
+            );
+            ensure!(
+                (0.0..=1.0).contains(&max_ambiguity),
+                "max-ambiguity must be in 0..=1"
+            );
+            let policy = curate::Policy {
+                cap,
+                demote_length,
+                max_length,
+                max_ambiguity,
+                min_words,
+                ceiling,
+                shallow: curate::ShallowCaps {
+                    covered: shallow_cap[0],
+                    orphan_order: shallow_cap[1],
+                    unplaced: shallow_cap[2],
+                    ratio: shallow_ratio,
+                },
+                drop_shallow,
+                drop_organellar,
+            };
+            let mut oversize = oversize_list
+                .as_deref()
+                .map(|p| -> Result<_> {
+                    Ok(BufWriter::new(
+                        std::fs::File::create(p)
+                            .with_context(|| format!("creating {}", p.display()))?,
+                    ))
+                })
+                .transpose()?;
+            let start = Instant::now();
+            let survey = curate::survey(
+                &reference,
+                &policy,
+                oversize.as_mut().map(|w| w as &mut dyn Write),
+            )?;
+            if let Some(mut list) = oversize {
+                list.flush()?;
+            }
+            let summary = curate::plan(&survey, &policy);
+            for (ordinal, error) in survey.parse_failures.iter().take(5) {
+                eprintln!("warning: skipped record {ordinal}: {error}");
+            }
+
+            if plan {
+                print!("{}", summary.render());
+                io::stdout().flush()?;
+                if let Some(hazard) = summary.hazard() {
+                    eprintln!();
+                    eprint!("{hazard}");
+                }
+                eprintln!("curate_s={:.6}", start.elapsed().as_secs_f64());
+            } else {
+                let output = output.expect("checked above");
+                let selection = curate::select(&survey, &policy, select, seed);
+                let invariants = curate::invariants(&survey, &selection);
+                // A vanished lineage is a bug, not a policy outcome.
+                ensure!(
+                    invariants.groups_preserved && invariants.names_preserved,
+                    "group preservation failed; lineages lost: {:?}",
+                    invariants.missing
+                );
+                let emitted = curate::emit(&reference, &output, &selection)?;
+                let wall = start.elapsed().as_secs_f64();
+                let manifest = report.unwrap_or_else(|| {
+                    PathBuf::from(format!("{}.curation.json", output.display()))
+                });
+                std::fs::write(
+                    &manifest,
+                    curate::report(&curate::Provenance {
+                        plan: &summary,
+                        policy: &policy,
+                        selector: select,
+                        seed,
+                        selection: &selection,
+                        emitted: Some(&emitted),
+                        invariants: &invariants,
+                        reference: &reference,
+                        output: Some(&output),
+                        wall,
+                    }),
+                )
+                .with_context(|| format!("writing {}", manifest.display()))?;
+                let after = curate::hazard_after(&survey, &selection, &policy);
+                if let Some(hazard) = summary.hazard_with(Some(&after)) {
+                    eprintln!();
+                    eprint!("{hazard}");
+                    eprintln!();
+                }
+                let c = &selection.counts;
+                eprintln!(
+                    "curated={} in={} out={} groups={} dropped_dup={} dropped_cap={} \
+                     dropped_shallow_cap={} dropped_filter={} restored={} curate_s={wall:.6}",
+                    output.display(),
+                    summary.parsed,
+                    emitted.records,
+                    summary.groups,
+                    c.duplicates,
+                    c.over_cap,
+                    c.over_shallow_cap + c.deliberate,
+                    c.low_complexity + c.ambiguous + c.oversize,
+                    c.restored,
+                );
+            }
         }
         Command::Inspect { db, verify } => {
             let index = Index::open(&db)?;

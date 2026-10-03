@@ -1,11 +1,13 @@
 //! Deterministic, versioned SINTAX-style classification.
 pub mod classify;
+pub mod curate;
 pub mod index;
 pub mod input;
 pub mod rank;
 pub mod rng;
 pub mod scoring;
 pub mod sequence;
+pub mod sketch;
 pub mod taxonomy;
 
 pub const ALGORITHM_VERSION: u32 = 1;

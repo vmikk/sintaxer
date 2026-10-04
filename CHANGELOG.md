@@ -1,4 +1,14 @@
 
+## [0.6.0]
+
+### Added
+- `--weights off|df|genus|family` scores each matched word by its rarity, and `--weight-share` sets the informative share of the vocabulary. The default `off` reproduces the unweighted output exactly.
+- `index` and `inspect` print a per-rank count of annotated references, which makes a wrongly delimited `tax=` field obvious.
+
+### Changed
+- Index format bumped to 3 (per-word distinct-taxon counts); rebuild existing indexes.
+- `--risk` can no longer be combined with `--weights`.
+
 ## [0.5.0]
 
 ### Added

@@ -2,7 +2,7 @@
 //!
 //! Used by `--exact`, by tests, and as the fallback when candidate
 //! selection can't be trusted.
-use crate::{SAMPLE_SIZE, index::Index};
+use crate::{SAMPLE_SIZE, index::Index, weight};
 use anyhow::Result;
 
 pub type Sample = [u16; SAMPLE_SIZE];
@@ -68,20 +68,37 @@ impl Top {
 }
 
 /// Brute-force reference implementation for tests and diagnostics.
-pub fn oracle_scores(reference_words: &[Vec<u16>], sample: &Sample) -> Vec<u8> {
+pub fn oracle_scores(
+    reference_words: &[Vec<u16>],
+    sample: &Sample,
+    weights: &weight::Table,
+) -> Vec<u8> {
     reference_words
         .iter()
-        .map(|words| sample.iter().filter(|w| words.contains(w)).count() as u8)
+        .map(|words| {
+            sample
+                .iter()
+                .filter(|w| words.contains(w))
+                .map(|&w| u32::from(weights.get(w)))
+                .sum::<u32>() as u8
+        })
         .collect()
 }
 
-pub fn scalar_scores(index: &Index, sample: &Sample, scores: &mut Vec<u8>) -> Result<()> {
+pub fn scalar_scores(
+    index: &Index,
+    sample: &Sample,
+    weights: &weight::Table,
+    scores: &mut Vec<u8>,
+) -> Result<()> {
     scores.resize(index.references, 0);
     scores.fill(0);
     for &word in sample {
+        // `SAMPLE_SIZE * MAX_WEIGHT` is 128, so a u8 counter can't overflow.
+        let w = weights.get(word);
         index
             .row(word)?
-            .visit(0, index.references, |id| scores[id] += 1);
+            .visit(0, index.references, |id| scores[id] += w);
     }
     Ok(())
 }

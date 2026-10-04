@@ -4,6 +4,7 @@ use crate::{
     rank::{self, Bound},
     rng, scoring, sequence,
     taxonomy::RANKS,
+    weight,
 };
 use anyhow::{Result, ensure};
 use clap::ValueEnum;
@@ -29,6 +30,10 @@ pub struct Config {
     /// Largest tolerated expected number of pruned references that could have won a
     /// replicate. Exceeding it widens the candidate set.
     pub risk: f64,
+    /// Per-word weight table used in scoring. `Off` is the published algorithm.
+    pub weights: weight::Source,
+    /// Percentage of occurring words treated as informative under `weights`.
+    pub weight_share: u8,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -39,6 +44,8 @@ impl Default for Config {
             exact: false,
             candidates: 2048,
             risk: 0.0,
+            weights: weight::Source::Off,
+            weight_share: weight::DEFAULT_SHARE,
         }
     }
 }
@@ -52,6 +59,16 @@ impl Config {
         ensure!(
             self.risk.is_finite() && self.risk >= 0.0,
             "risk tolerance must be finite and non-negative"
+        );
+        // `Bound` assumes an unweighted binomial score. Weighting breaks that model in the
+        // unsafe direction, so refuse to report a bound rather than report a wrong one.
+        ensure!(
+            self.risk == 0.0 || self.weights == weight::Source::Off,
+            "--risk models unweighted scores and cannot be combined with --weights"
+        );
+        ensure!(
+            (1..=99).contains(&self.weight_share),
+            "weight share must be a percentage in 1..=99"
         );
         Ok(())
     }
@@ -189,12 +206,13 @@ fn exact_tops(
     index: &Index,
     words: &[u16],
     samples: &[[u16; SAMPLE_SIZE]],
+    weights: &weight::Table,
     ws: &mut Workspace,
 ) -> Result<Vec<scoring::Top>> {
     let mut tops = Vec::with_capacity(BOOTSTRAPS);
     for sample in samples {
         let codes: [u16; SAMPLE_SIZE] = std::array::from_fn(|i| words[sample[i] as usize]);
-        scoring::scalar_scores(index, &codes, &mut ws.scores)?;
+        scoring::scalar_scores(index, &codes, weights, &mut ws.scores)?;
         tops.push(scoring::Top::from_scores(&ws.scores));
     }
     Ok(tops)
@@ -203,7 +221,8 @@ fn exact_tops(
 /// Expected number of replicates whose winner could have differed had the pruned
 /// references been scored.
 fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabulary: usize) -> f64 {
-    let mut cache = [f64::NAN; SAMPLE_SIZE + 1];
+    // Indexed by score, so it must span the weighted ceiling, not just SAMPLE_SIZE.
+    let mut cache = [f64::NAN; SAMPLE_SIZE * weight::MAX_WEIGHT as usize + 1];
     let mut risk = 0.0;
     for top in tops {
         // Scores below two are never recorded, so that is the floor a pruned reference must reach.
@@ -217,6 +236,7 @@ fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabul
 }
 
 /// Score every replicate of one strand, exactly or against candidates.
+#[allow(clippy::too_many_arguments)]
 fn score_strand(
     index: &Index,
     words: &[u16],
@@ -224,6 +244,7 @@ fn score_strand(
     key: &blake3::Hash,
     strand: u8,
     config: &Config,
+    weights: &weight::Table,
     ws: &mut Workspace,
 ) -> Result<Outcome> {
     let mut escalated = false;
@@ -232,7 +253,7 @@ fn score_strand(
     let worth_it = !config.exact && index.references > config.candidates.saturating_mul(4);
     let mut from_candidates = worth_it;
     let mut tops = if !worth_it {
-        exact_tops(index, words, samples, ws)?
+        exact_tops(index, words, samples, weights, ws)?
     } else {
         ws.rank.rank(index, words)?;
         // Widen the candidate set a couple of times at most, then fall back to the exact
@@ -241,7 +262,7 @@ fn score_strand(
         let mut target = config.candidates;
         loop {
             let threshold = ws.rank.select(target);
-            ws.rank.project(index, words)?;
+            ws.rank.project(index, words, weights)?;
             let mut tops = Vec::with_capacity(BOOTSTRAPS);
             for sample in samples {
                 tops.push(ws.rank.replicate(sample));
@@ -262,7 +283,7 @@ fn score_strand(
             escalated = true;
             if oversized || unseparated || target >= ceiling || threshold <= 1 {
                 from_candidates = false;
-                break exact_tops(index, words, samples, ws)?;
+                break exact_tops(index, words, samples, weights, ws)?;
             }
             target = target.saturating_mul(8).min(ceiling);
         }
@@ -273,7 +294,7 @@ fn score_strand(
     let mut winners = Vec::with_capacity(BOOTSTRAPS);
     for (boot, top) in tops.iter().enumerate() {
         max = max.max(top.score);
-        if top.score >= 2 {
+        if top.score >= weight::FLOOR {
             let mut ties = rng::stream(key, strand, boot, 1);
             let offset = ties.bounded(top.count as u64) as usize;
             winners.push(if from_candidates {
@@ -294,9 +315,14 @@ pub fn classify(
     index: &Index,
     sequence: &[u8],
     config: &Config,
+    weights: &weight::Table,
     ws: &mut Workspace,
 ) -> Result<(Prediction, Timings)> {
     config.validate()?;
+    ensure!(
+        weights.source() == config.weights,
+        "weight table does not match the configured source"
+    );
     let mut timings = Timings::default();
     let start = Instant::now();
     let (normalized, unknown) = sequence::normalize(sequence);
@@ -327,7 +353,7 @@ pub fn classify(
         timings.sampling += start.elapsed();
 
         let start = Instant::now();
-        let outcome = score_strand(index, &words, &samples, &key, strand, config, ws);
+        let outcome = score_strand(index, &words, &samples, &key, strand, config, weights, ws);
         timings.scoring += start.elapsed();
         if strand == 0 {
             ws.forward = words;

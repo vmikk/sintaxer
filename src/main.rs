@@ -5,7 +5,7 @@ use sintaxer::{
     classify::{self, Config, Strand, Timings},
     curate,
     index::{self, Index},
-    input,
+    input, taxonomy, weight,
 };
 use std::{
     io::{self, BufWriter, Write},
@@ -58,6 +58,13 @@ enum Command {
         /// reference could have tied exceeds this (0 disables). Escalates often on divergent queries.
         #[arg(long, default_value_t = 0.0)]
         risk: f64,
+        /// Per-word scoring weights, down-weighting words common across the database.
+        /// `off` is the published algorithm.
+        #[arg(long, value_enum, default_value_t = weight::Source::Off)]
+        weights: weight::Source,
+        /// Percentage of the database's words treated as informative. Ignored when --weights is off.
+        #[arg(long, default_value_t = weight::DEFAULT_SHARE)]
+        weight_share: u8,
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
@@ -141,6 +148,7 @@ struct BatchResult {
 fn process(
     index: &Index,
     config: &Config,
+    weights: &weight::Table,
     batch: Vec<Record>,
     workspace: &mut Workspace,
 ) -> Result<BatchResult> {
@@ -152,8 +160,9 @@ fn process(
         timings: Timings::default(),
     };
     for record in batch {
-        let (prediction, times) = classify::classify(index, &record.sequence, config, workspace)
-            .with_context(|| format!("query {:?}", record.label))?;
+        let (prediction, times) =
+            classify::classify(index, &record.sequence, config, weights, workspace)
+                .with_context(|| format!("query {:?}", record.label))?;
         result
             .output
             .push_str(&prediction.tsv(&record.label, config.cutoff));
@@ -180,6 +189,7 @@ fn run_classify(
     config.validate()?;
     let wall = Instant::now();
     let index = Index::open(db)?;
+    let weights = weight::Table::build(&index, config.weights, config.weight_share)?;
     let open_time = wall.elapsed();
     let mut reader = input::reader(reads)?;
     // File outputs are written atomically; a failure leaves any old output intact.
@@ -218,6 +228,7 @@ fn run_classify(
             let (result_tx, result_rx) = mpsc::sync_channel::<Result<BatchResult>>(1);
             let index = &index;
             let config = &config;
+            let weights = &weights;
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("sintaxer-{worker}"))
@@ -225,7 +236,7 @@ fn run_classify(
                         let mut workspace = Workspace::default();
                         while let Ok(batch) = rx.recv() {
                             if result_tx
-                                .send(process(index, config, batch, &mut workspace))
+                                .send(process(index, config, weights, batch, &mut workspace))
                                 .is_err()
                             {
                                 break;
@@ -340,8 +351,31 @@ fn run_classify(
                 0.0
             }
         );
+        // Report the weights that reached the kernel. A single-tier table only scales
+        // scores by a constant and cannot change any call.
+        let (plain, informative) = weights.tiers();
+        eprintln!(
+            "classifier={} weights={} weights_blake3={} words_informative={informative} words_plain={plain}",
+            sintaxer::CLASSIFIER_VERSION,
+            weights.label(),
+            weights.digest()
+        );
     }
     Ok(())
+}
+
+/// `annotated=d:..,k:..,...`: references carrying a name at each stored rank.
+///
+/// A near-zero genus count usually means the FASTA's rank separator is not `,`.
+fn census_line(index: &Index) -> String {
+    let census = index.rank_census();
+    let ranks = std::str::from_utf8(taxonomy::RANKS).expect("ascii");
+    let fields: Vec<String> = ranks
+        .chars()
+        .zip(census)
+        .map(|(rank, count)| format!("{rank}:{count}"))
+        .collect();
+    format!("annotated={}", fields.join(","))
 }
 
 fn main() -> Result<()> {
@@ -355,10 +389,13 @@ fn main() -> Result<()> {
             }
             let start = Instant::now();
             index::build(&reference, &output)?;
+            let elapsed = start.elapsed().as_secs_f64();
+            let opened = Index::open(&output)?;
             eprintln!(
-                "index={} build_s={:.6}",
+                "index={} build_s={elapsed:.6} references={} {}",
                 output.display(),
-                start.elapsed().as_secs_f64()
+                opened.references,
+                census_line(&opened)
             );
         }
         Command::Curate {
@@ -516,10 +553,11 @@ fn main() -> Result<()> {
                 index.verify()?;
             }
             println!(
-                "format={}\nalgorithm={}\nk=8\nreferences={}\ntaxonomy_nodes={}\ndense_rows={}\nbytes={}\nsequence_bytes={}\nsource_blake3={}\nverified={verify}",
+                "format={}\nalgorithm={}\nk=8\nreferences={}\n{}\ntaxonomy_nodes={}\ndense_rows={}\nbytes={}\nsequence_bytes={}\nsource_blake3={}\nverified={verify}",
                 index.format_version(),
-                sintaxer::ALGORITHM_VERSION,
+                index.algorithm_version(),
                 index.references,
+                census_line(&index),
                 index.nodes,
                 index.dense_rows(),
                 index.file_bytes(),
@@ -538,6 +576,8 @@ fn main() -> Result<()> {
             exact,
             candidates,
             risk,
+            weights,
+            weight_share,
             profile,
         } => {
             run_classify(
@@ -552,6 +592,8 @@ fn main() -> Result<()> {
                     exact,
                     candidates,
                     risk,
+                    weights,
+                    weight_share,
                 },
                 profile,
             )?;

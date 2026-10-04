@@ -8,6 +8,7 @@ use crate::{
     K, SAMPLE_SIZE, WORDS,
     index::{Index, Row},
     scoring::Top,
+    weight,
 };
 use anyhow::{Result, ensure};
 
@@ -21,14 +22,15 @@ const PLANE_CAP: usize = 17;
 /// Marks a word absent from the query in the reverse lookup table.
 const ABSENT: u16 = u16::MAX;
 
-/// Add one membership bitmap into bit-sliced counters (carry-save).
+/// Add `2^shift` into bit-sliced counters wherever `input` has a bit set.
 ///
 /// Stops as soon as every lane's carry is zero, usually after one or two planes.
-fn ripple_add(planes: &mut [u64], input: &[u64], depth: usize, carry: &mut Vec<u64>) {
+/// Weights are powers of two, so a weight is applied by starting `shift` planes up.
+fn ripple_add(planes: &mut [u64], input: &[u64], depth: usize, carry: &mut Vec<u64>, shift: usize) {
     let lanes = input.len();
     carry.clear();
     carry.extend_from_slice(input);
-    for plane in 0..depth {
+    for plane in shift..depth {
         let mut any = 0;
         let base = plane * lanes;
         for lane in 0..lanes {
@@ -94,6 +96,10 @@ pub struct Workspace {
     pub histogram: Vec<u32>,
     /// References selected for the bootstrap phase, ascending.
     pub candidates: Vec<u32>,
+    /// `log2(weight)` per query-vocabulary position, parallel to the words given to `project`.
+    shifts: Vec<u8>,
+    /// Counter planes needed by the heaviest possible replicate.
+    depth: usize,
 }
 
 impl Default for Workspace {
@@ -112,6 +118,8 @@ impl Default for Workspace {
             counts: Vec::new(),
             histogram: Vec::new(),
             candidates: Vec::new(),
+            shifts: Vec::new(),
+            depth: depth_for(SAMPLE_SIZE),
         }
     }
 }
@@ -149,6 +157,7 @@ impl Workspace {
                     &self.tile[..lanes],
                     depth,
                     &mut self.carry,
+                    0,
                 );
             }
             for lane in 0..lanes {
@@ -214,18 +223,23 @@ impl Workspace {
     ///
     /// Each row is a bitmap over candidates that can be added straight into
     /// the counter planes during the bootstrap.
-    pub fn project(&mut self, index: &Index, words: &[u16]) -> Result<()> {
+    pub fn project(&mut self, index: &Index, words: &[u16], weights: &weight::Table) -> Result<()> {
         for &word in &self.touched {
             self.lookup[word as usize] = ABSENT;
             self.present[word as usize / 64] &= !(1 << (word % 64));
         }
         self.touched.clear();
         ensure!(words.len() < ABSENT as usize, "query vocabulary too large");
+        self.shifts.clear();
+        self.shifts.reserve(words.len());
         for (i, &word) in words.iter().enumerate() {
             self.lookup[word as usize] = i as u16;
             self.present[word as usize / 64] |= 1 << (word % 64);
             self.touched.push(word);
+            self.shifts.push(weights.get(word).trailing_zeros() as u8);
         }
+        self.depth = depth_for(SAMPLE_SIZE * weights.max() as usize);
+        debug_assert!(self.depth <= PLANE_CAP);
 
         let lanes = self.candidates.len().div_ceil(64).max(1);
         self.matrix.clear();
@@ -246,16 +260,23 @@ impl Workspace {
 
     /// Exact maximum and complete tie set for one replicate, over candidates.
     ///
-    /// Scores are at most [`SAMPLE_SIZE`], so six planes suffice. Candidate
-    /// positions are in reference order, so tie draws match the exact path.
+    /// Scores are at most `SAMPLE_SIZE * max weight`. Candidate positions are
+    /// in reference order, so tie draws match the exact path.
     pub fn replicate(&mut self, sample: &[u16; SAMPLE_SIZE]) -> Top {
         let lanes = self.candidates.len().div_ceil(64).max(1);
-        let depth = depth_for(SAMPLE_SIZE);
+        let depth = self.depth;
         self.candidate_planes.clear();
         self.candidate_planes.resize(depth * lanes, 0);
-        for &word in sample {
-            let row = &self.matrix[word as usize * lanes..][..lanes];
-            ripple_add(&mut self.candidate_planes, row, depth, &mut self.carry);
+        for &position in sample {
+            let row = &self.matrix[position as usize * lanes..][..lanes];
+            let shift = self.shifts[position as usize] as usize;
+            ripple_add(
+                &mut self.candidate_planes,
+                row,
+                depth,
+                &mut self.carry,
+                shift,
+            );
         }
         self.valid.clear();
         self.valid.resize(lanes, u64::MAX);

@@ -10,10 +10,11 @@ use std::{
 };
 
 const HEADER: usize = 256;
-const ENTRY: usize = 24;
+/// Word-directory record: offset, length, df, layout, distinct genera, distinct families.
+const ENTRY: usize = 32;
 const NODE: usize = 24;
 const MAGIC: &[u8; 8] = b"SINTAXER";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 // Header slots for the packed sequence sections.
 const H_SEQ_DIR: usize = 160;
@@ -33,6 +34,64 @@ fn put64(b: &mut [u8], p: usize, v: u64) {
 }
 fn align64(n: u64) -> u64 {
     n.div_ceil(64) * 64
+}
+
+/// Distinct genera and families containing each word, swept from the postings.
+///
+/// Word-major order lets a per-node stamp array (holding the current word)
+/// deduplicate each incidence in O(1), with no set or sort.
+fn sweep_taxa(
+    map: &[u8],
+    references: usize,
+    refs_offset: usize,
+    nodes_offset: usize,
+    nodes: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut genera = vec![0u32; WORDS];
+    let mut families = vec![0u32; WORDS];
+    // A missing rank is its own empty-named node, so these count taxon identities,
+    // not annotated names: a reference without a genus contributes its parent's sentinel.
+    let mut stamp_g = vec![u32::MAX; nodes];
+    let mut stamp_f = vec![u32::MAX; nodes];
+    let leaf = |reference: usize| u32_at(map, refs_offset + reference * 4);
+    let parent = |node: u32| u32_at(map, nodes_offset + node as usize * NODE);
+    for word in 0..WORDS {
+        let p = HEADER + word * ENTRY;
+        let offset = u64_at(map, p) as usize;
+        let length = u64_at(map, p + 8) as usize;
+        let dense = map[p + 20] == 1;
+        let stamp = word as u32;
+        let mut count = |reference: usize| {
+            let g = leaf(reference);
+            if stamp_g[g as usize] != stamp {
+                stamp_g[g as usize] = stamp;
+                genera[word] += 1;
+                let f = parent(g);
+                if stamp_f[f as usize] != stamp {
+                    stamp_f[f as usize] = stamp;
+                    families[word] += 1;
+                }
+            }
+        };
+        if dense {
+            for (i, byte) in map[offset..offset + length].iter().enumerate() {
+                let mut bits = *byte;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let reference = i * 8 + bit;
+                    if reference < references {
+                        count(reference);
+                    }
+                }
+            }
+        } else {
+            for chunk in map[offset..offset + length].chunks_exact(4) {
+                count(u32::from_le_bytes(chunk.try_into().unwrap()) as usize);
+            }
+        }
+    }
+    (genera, families)
 }
 
 pub struct Index {
@@ -483,10 +542,45 @@ impl Index {
                 "sequence and posting sections disagree on word {word}"
             );
         }
+        // Recompute the taxon counts from the postings, just checked against the sequences.
+        let (genera, families) = sweep_taxa(
+            &self.map,
+            self.references,
+            self.refs_offset,
+            self.nodes_offset,
+            self.nodes,
+        );
+        for word in 0..WORDS {
+            ensure!(
+                genera[word] == self.genus_frequency(word as u16)
+                    && families[word] == self.family_frequency(word as u16),
+                "directory and postings disagree on taxon counts for word {word}"
+            );
+        }
         Ok(())
     }
     pub fn format_version(&self) -> u32 {
         FORMAT_VERSION
+    }
+    /// The algorithm version recorded in the file (not the binary's constant, so a
+    /// loader bug would show up here).
+    pub fn algorithm_version(&self) -> u32 {
+        u32_at(&self.map, 12)
+    }
+    /// References carrying a name at each stored rank, `d` through `g`.
+    ///
+    /// Makes a wrong rank separator visible: such a database builds fine but
+    /// parses as a single rank.
+    pub fn rank_census(&self) -> [u64; 7] {
+        let mut census = [0u64; 7];
+        for reference in 0..self.references {
+            for (rank, node) in self.lineage(reference).into_iter().enumerate() {
+                if !self.name_bytes(node).is_empty() {
+                    census[rank] += 1;
+                }
+            }
+        }
+        census
     }
     /// Bytes held by the packed reference sequences, directory included.
     pub fn sequence_bytes(&self) -> usize {
@@ -500,6 +594,22 @@ impl Index {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+    /// References containing `word`, read straight from the directory.
+    ///
+    /// Avoids `row`, which would validate (and fault in) the word's payload.
+    pub fn document_frequency(&self, word: u16) -> u32 {
+        u32_at(&self.map, HEADER + word as usize * ENTRY + 16)
+    }
+    /// Distinct genera containing `word`.
+    ///
+    /// Unlike `df`, unaffected by duplicated records within a genus.
+    pub fn genus_frequency(&self, word: u16) -> u32 {
+        u32_at(&self.map, HEADER + word as usize * ENTRY + 24)
+    }
+    /// Distinct families containing `word`.
+    pub fn family_frequency(&self, word: u16) -> u32 {
+        u32_at(&self.map, HEADER + word as usize * ENTRY + 28)
     }
     pub fn dense_rows(&self) -> usize {
         (0..WORDS)
@@ -744,6 +854,14 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         }
         drop(reader);
         std::fs::remove_file(path)?;
+    }
+    let nodes = u32_at(&map, 20) as usize;
+    let (genera, families) =
+        sweep_taxa(&map, n, refs_offset as usize, nodes_offset as usize, nodes);
+    for w in 0..WORDS {
+        let p = HEADER + w * ENTRY;
+        put32(&mut map, p + 24, genera[w]);
+        put32(&mut map, p + 28, families[w]);
     }
     let digest = blake3::hash(&map[HEADER..]);
     map[96..128].copy_from_slice(digest.as_bytes());

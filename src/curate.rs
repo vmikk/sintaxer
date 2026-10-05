@@ -15,19 +15,13 @@ use std::{io::Write, path::Path};
 /// candidates by dissimilarity.
 pub const SKETCH: usize = 32;
 
+/// Properties of a record itself. Policy thresholds are applied later by
+/// [`Policy`], so one survey can serve many policies (see [`save`], [`load`]).
 pub mod flag {
-    /// Longer than the soft length threshold; sorts last among candidates.
-    pub const DEMOTED: u8 = 1 << 0;
-    /// Over the hard length ceiling, if one is set.
-    pub const OVERSIZE: u8 = 1 << 1;
-    /// Too few distinct words to classify against meaningfully.
-    pub const LOW_COMPLEXITY: u8 = 1 << 2;
-    /// Organellar or spike-in decoy (`d:_mitochondrion`, `Unispike*`, ...).
-    pub const ORGANELLAR: u8 = 1 << 3;
     /// Neither family nor genus annotated.
-    pub const SHALLOW: u8 = 1 << 4;
-    /// Above the non-ACGT fraction limit.
-    pub const AMBIGUOUS: u8 = 1 << 5;
+    pub const SHALLOW: u8 = 1 << 0;
+    /// Organellar or spike-in decoy (`d:_mitochondrion`, `Unispike*`, ...).
+    pub const ORGANELLAR: u8 = 1 << 1;
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +39,8 @@ pub struct Policy {
     pub min_words: usize,
     /// Sketch distance past which candidates are considered equally diverse.
     pub ceiling: f32,
+    /// LSH bands consulted by [`Selector::Cover`]; see [`BANDS`].
+    pub cover_bands: usize,
     /// Caps for records with neither family nor genus.
     pub shallow: ShallowCaps,
     /// Validation switches; not meant for production databases.
@@ -93,6 +89,7 @@ impl Default for Policy {
             max_ambiguity: 0.10,
             min_words: 32,
             ceiling: DIVERSITY_CEILING,
+            cover_bands: 4,
             shallow: ShallowCaps::default(),
             drop_shallow: false,
             drop_organellar: false,
@@ -100,8 +97,32 @@ impl Default for Policy {
     }
 }
 
+impl Policy {
+    /// Longer than the soft length threshold: sorts last among candidates but is
+    /// never dropped for it.
+    pub fn demoted(&self, summary: &Summary) -> bool {
+        summary.length as usize > self.demote_length
+    }
+    /// Over the hard length ceiling, if one is set.
+    pub fn oversize(&self, summary: &Summary) -> bool {
+        self.max_length
+            .is_some_and(|max| summary.length as usize > max)
+    }
+    pub fn low_complexity(&self, summary: &Summary) -> bool {
+        (summary.words as usize) < self.min_words
+    }
+    pub fn ambiguous(&self, summary: &Summary) -> bool {
+        summary.length > 0
+            && f64::from(summary.ambiguous) / f64::from(summary.length) > self.max_ambiguity
+    }
+    /// Hard rejects, applied before anything takes a cap slot.
+    pub fn rejects(&self, summary: &Summary) -> bool {
+        self.low_complexity(summary) || self.ambiguous(summary) || self.oversize(summary)
+    }
+}
+
 /// One record's pass-1 summary: everything selection needs, so that pass 2
-/// is a plain byte copy.
+/// is a plain byte copy. Policy-free, so it can be cached across runs.
 #[derive(Clone, Debug)]
 pub struct Summary {
     /// Position in the input, counting records that failed to parse. Pass 2
@@ -140,6 +161,34 @@ pub struct Survey {
 }
 
 impl Survey {
+    /// Records per order in genus-annotated lineages beneath it. Single source of
+    /// truth shared by the report and the shallow caps.
+    pub fn order_coverage(&self) -> std::collections::HashMap<u32, u64> {
+        let mut coverage = std::collections::HashMap::new();
+        for group in &self.groups {
+            if !self.rank_name(group, GENUS).is_empty() {
+                *coverage.entry(group.path[ORDER]).or_default() += u64::from(group.records);
+            }
+        }
+        coverage
+    }
+    /// Guard role this group plays, or `None` if it names a family or genus.
+    pub fn shallow_class(
+        &self,
+        group: &Group,
+        coverage: &std::collections::HashMap<u32, u64>,
+    ) -> Option<Shallow> {
+        if !self.rank_name(group, FAMILY).is_empty() || !self.rank_name(group, GENUS).is_empty() {
+            return None;
+        }
+        Some(if self.rank_name(group, ORDER).is_empty() {
+            Shallow::Unplaced
+        } else if coverage.contains_key(&group.path[ORDER]) {
+            Shallow::Covered
+        } else {
+            Shallow::OrphanOrder
+        })
+    }
     pub fn group_of(&self, summary: &Summary) -> &Group {
         &self.groups[self.index_of[summary.group as usize] as usize]
     }
@@ -165,13 +214,10 @@ fn is_organellar(domain: &str) -> bool {
 
 /// Pass 1: parse every record once and keep a fixed-size summary of each.
 ///
-/// `oversize` receives the label of every record past `policy.demote_length`
-/// as it is seen, since summaries do not keep labels.
-pub fn survey(
-    reference: &Path,
-    policy: &Policy,
-    mut oversize: Option<&mut dyn Write>,
-) -> Result<Survey> {
+/// Policy-free, so one survey serves many policies ([`save`], [`load`]).
+/// `oversize` receives labels of records past its length threshold as they
+/// are seen, since summaries do not keep labels.
+pub fn survey(reference: &Path, mut oversize: Option<(usize, &mut dyn Write)>) -> Result<Survey> {
     let mut tree = TreeBuilder::default();
     let mut summaries: Vec<Summary> = Vec::new();
     let mut parse_failures = Vec::new();
@@ -210,26 +256,16 @@ pub fn survey(
             .count();
 
         let mut flags = 0u8;
-        if seq.len() > policy.demote_length {
-            flags |= flag::DEMOTED;
-            if let Some(list) = oversize.as_deref_mut() {
-                writeln!(list, "{label}\t{}", seq.len()).context("writing oversize list")?;
-            }
-        }
-        if policy.max_length.is_some_and(|m| seq.len() > m) {
-            flags |= flag::OVERSIZE;
-        }
-        if words.len() < policy.min_words {
-            flags |= flag::LOW_COMPLEXITY;
-        }
-        if !seq.is_empty() && (ambiguous as f64) / (seq.len() as f64) > policy.max_ambiguity {
-            flags |= flag::AMBIGUOUS;
-        }
         if lineage[FAMILY].is_none() && lineage[GENUS].is_none() {
             flags |= flag::SHALLOW;
         }
         if lineage[DOMAIN].as_deref().is_some_and(is_organellar) {
             flags |= flag::ORGANELLAR;
+        }
+        if let Some((threshold, list)) = oversize.as_mut()
+            && seq.len() > *threshold
+        {
+            writeln!(list, "{label}\t{}", seq.len()).context("writing oversize list")?;
         }
 
         let mut digest = [0u8; 16];
@@ -247,9 +283,24 @@ pub fn survey(
         });
     }
     ensure!(!summaries.is_empty(), "empty reference database");
+    let (index_of, groups) = index_groups(&tree, &summaries)?;
 
-    // `insert` walks all seven ranks, so rank-6 nodes are exactly the distinct
-    // stored lineages.
+    Ok(Survey {
+        summaries,
+        tree,
+        groups,
+        index_of,
+        records,
+        bases,
+        unknown_bases,
+        unknown_records,
+        parse_failures,
+    })
+}
+
+/// Node ID -> group index, and the groups themselves. Rank-6 nodes are exactly
+/// the distinct stored lineages. Rebuilt on cache load rather than stored.
+fn index_groups(tree: &TreeBuilder, summaries: &[Summary]) -> Result<(Vec<u32>, Vec<Group>)> {
     let mut index_of = vec![u32::MAX; tree.nodes.len()];
     let mut groups = Vec::new();
     for (id, node) in tree.nodes.iter().enumerate() {
@@ -269,11 +320,241 @@ pub fn survey(
             records: 0,
         });
     }
-    for summary in &summaries {
-        groups[index_of[summary.group as usize] as usize].records += 1;
+    for summary in summaries {
+        let slot = *index_of
+            .get(summary.group as usize)
+            .filter(|&&g| g != u32::MAX)
+            .context("summary names a node that is not a stored lineage")?;
+        groups[slot as usize].records += 1;
+    }
+    Ok((index_of, groups))
+}
+
+// --- Survey cache: pass 1 is policy-free, so it can be reused ---
+
+const CACHE_MAGIC: &[u8; 8] = b"STXSURV\0";
+
+/// Cache key: size and mtime of the input. Not a content hash, so an in-place
+/// rewrite with identical size and mtime goes unnoticed; [`emit`] re-checks
+/// the record count for that reason.
+fn source_key(reference: &Path) -> Result<(u64, i64, u32)> {
+    let meta =
+        std::fs::metadata(reference).with_context(|| format!("reading {}", reference.display()))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    Ok(match modified {
+        Some(d) => (meta.len(), d.as_secs() as i64, d.subsec_nanos()),
+        None => (meta.len(), 0, 0),
+    })
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl Cursor<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8]> {
+        let end = self.at.checked_add(n).context("truncated survey cache")?;
+        ensure!(end <= self.bytes.len(), "truncated survey cache");
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    /// Length-prefixed UTF-8 string, bounded by the remaining input so a corrupt
+    /// length can't trigger a huge allocation.
+    fn string(&mut self) -> Result<String> {
+        let len = self.u32()? as usize;
+        ensure!(len <= self.bytes.len() - self.at, "truncated survey cache");
+        String::from_utf8(self.take(len)?.to_vec()).context("invalid UTF-8 in survey cache")
+    }
+}
+
+/// Write a survey cache next to the database, atomically so an interrupted
+/// run can't leave a truncated cache behind.
+pub fn save(survey: &Survey, reference: &Path, path: &Path) -> Result<()> {
+    let (len, secs, nanos) = source_key(reference)?;
+    let mut out = Vec::with_capacity(survey.summaries.len() * 110 + (1 << 16));
+    out.extend_from_slice(CACHE_MAGIC);
+    put_u32(&mut out, sketch::CURATION_VERSION);
+    put_u64(&mut out, len);
+    out.extend_from_slice(&secs.to_le_bytes());
+    put_u32(&mut out, nanos);
+    for value in [
+        survey.records,
+        survey.bases,
+        survey.unknown_bases,
+        survey.unknown_records,
+    ] {
+        put_u64(&mut out, value);
     }
 
-    Ok(Survey {
+    put_u64(&mut out, survey.summaries.len() as u64);
+    for summary in &survey.summaries {
+        for value in [
+            summary.ordinal,
+            summary.group,
+            summary.length,
+            summary.words,
+            summary.ambiguous,
+        ] {
+            put_u32(&mut out, value);
+        }
+        out.extend_from_slice(&summary.digest);
+        out.push(summary.flags);
+        let values = summary.sketch.values();
+        out.push(values.len() as u8);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    put_u64(&mut out, survey.tree.nodes.len() as u64);
+    for node in &survey.tree.nodes {
+        put_u32(&mut out, node.parent);
+        out.push(node.rank);
+        put_u32(&mut out, node.name.len() as u32);
+        out.extend_from_slice(node.name.as_bytes());
+    }
+
+    put_u64(&mut out, survey.parse_failures.len() as u64);
+    for (ordinal, message) in &survey.parse_failures {
+        put_u32(&mut out, *ordinal);
+        put_u32(&mut out, message.len() as u32);
+        out.extend_from_slice(message.as_bytes());
+    }
+
+    out.extend_from_slice(blake3::hash(&out).as_bytes());
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".sintaxer-survey-")
+        .tempfile_in(parent)?;
+    temp.write_all(&out)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a survey cache, or `Ok(None)` if there is none at `path`. A cache for
+/// a different database or contract, or a damaged one, is an error.
+pub fn load(reference: &Path, path: &Path) -> Result<Option<Survey>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    ensure!(bytes.len() > 40, "{} is not a survey cache", path.display());
+    let (body, digest) = bytes.split_at(bytes.len() - 32);
+    ensure!(
+        blake3::hash(body).as_bytes() == digest,
+        "{} is damaged; delete it and re-survey",
+        path.display()
+    );
+
+    let mut c = Cursor { bytes: body, at: 0 };
+    ensure!(
+        c.take(8)? == CACHE_MAGIC,
+        "{} is not a survey cache",
+        path.display()
+    );
+    let version = c.u32()?;
+    ensure!(
+        version == sketch::CURATION_VERSION,
+        "{} was written by curation version {version}, this is {}; delete it and re-survey",
+        path.display(),
+        sketch::CURATION_VERSION
+    );
+    let (len, secs, nanos) = source_key(reference)?;
+    let cached = (
+        c.u64()?,
+        i64::from_le_bytes(c.take(8)?.try_into().unwrap()),
+        c.u32()?,
+    );
+    ensure!(
+        cached == (len, secs, nanos),
+        "{} describes a different {} (size/mtime {:?}, found {:?}); delete it and re-survey",
+        path.display(),
+        reference.display(),
+        cached,
+        (len, secs, nanos)
+    );
+
+    let (records, bases) = (c.u64()?, c.u64()?);
+    let (unknown_bases, unknown_records) = (c.u64()?, c.u64()?);
+
+    let count = c.u64()? as usize;
+    ensure!(count as u64 <= records, "corrupt survey cache");
+    let mut summaries = Vec::with_capacity(count);
+    let mut values = [0u16; SKETCH];
+    for _ in 0..count {
+        let ordinal = c.u32()?;
+        let group = c.u32()?;
+        let length = c.u32()?;
+        let words = c.u32()?;
+        let ambiguous = c.u32()?;
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(c.take(16)?);
+        let flags = c.u8()?;
+        let width = c.u8()? as usize;
+        ensure!(width <= SKETCH, "corrupt sketch in survey cache");
+        for value in values.iter_mut().take(width) {
+            *value = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
+        }
+        summaries.push(Summary {
+            ordinal,
+            group,
+            length,
+            words,
+            ambiguous,
+            digest,
+            sketch: Sketch::restore(&values[..width]),
+            flags,
+        });
+    }
+    ensure!(!summaries.is_empty(), "empty reference database");
+
+    let nodes = c.u64()? as usize;
+    let mut restored = Vec::with_capacity(nodes.min(1 << 20));
+    for _ in 0..nodes {
+        let parent = c.u32()?;
+        let rank = c.u8()?;
+        let name = c.string()?;
+        restored.push(taxonomy::Node { parent, rank, name });
+    }
+    let tree = TreeBuilder::restore(restored);
+
+    let failures = c.u64()? as usize;
+    let mut parse_failures = Vec::with_capacity(failures.min(64));
+    for _ in 0..failures {
+        let ordinal = c.u32()?;
+        parse_failures.push((ordinal, c.string()?));
+    }
+    ensure!(c.at == body.len(), "trailing data in survey cache");
+
+    let (index_of, groups) = index_groups(&tree, &summaries)?;
+    Ok(Some(Survey {
         summaries,
         tree,
         groups,
@@ -283,7 +564,7 @@ pub fn survey(
         unknown_bases,
         unknown_records,
         parse_failures,
-    })
+    }))
 }
 
 // --- Plan: what a policy would do, without writing anything ---
@@ -311,6 +592,9 @@ pub struct Occupancy {
 
 pub struct Plan {
     pub cap: usize,
+    /// Hard length ceiling in force, so the hazard report can say whether the
+    /// records it describes were kept or dropped.
+    pub max_length: Option<usize>,
     /// Quantiles of within-lineage sketch distance over a bounded sample: all
     /// members, then only members within the length threshold.
     pub diversity: Option<[f32; 5]>,
@@ -366,7 +650,9 @@ fn percentiles(lengths: &mut [u32]) -> Percentiles {
     }
 }
 
-const CAPS: [usize; 9] = [1, 2, 3, 5, 10, 20, 25, 50, 100];
+/// Cap values for the cap curve; extends past the default cap so the policy
+/// marker is shown.
+const CAPS: [usize; 13] = [1, 2, 3, 5, 10, 20, 25, 50, 100, 250, 500, 1000, 2500];
 
 /// Sampled distribution of sketch distances within the same stored lineage,
 /// used to calibrate [`DIVERSITY_CEILING`].
@@ -436,7 +722,7 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
         .map(|g| {
             g.iter()
                 .copied()
-                .filter(|&i| survey.summaries[i as usize].flags & flag::DEMOTED == 0)
+                .filter(|&i| !policy.demoted(&survey.summaries[i as usize]))
                 .collect()
         })
         .collect();
@@ -459,13 +745,7 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
         })
         .collect();
 
-    // An order is covered when any lineage beneath it names a genus.
-    let mut order_has_genus = std::collections::HashSet::new();
-    for group in &survey.groups {
-        if !survey.rank_name(group, GENUS).is_empty() {
-            order_has_genus.insert(group.path[ORDER]);
-        }
-    }
+    let coverage = survey.order_coverage();
 
     let mut shallow = [0u64; 3];
     let (mut organellar, mut organellar_bases) = (0u64, 0u64);
@@ -478,26 +758,20 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
 
     for summary in &survey.summaries {
         let group = survey.group_of(summary);
-        if summary.flags & flag::SHALLOW != 0 {
-            let class = if survey.rank_name(group, ORDER).is_empty() {
-                Shallow::Unplaced
-            } else if order_has_genus.contains(&group.path[ORDER]) {
-                Shallow::Covered
-            } else {
-                Shallow::OrphanOrder
-            };
+        if let Some(class) = survey.shallow_class(group, &coverage) {
+            debug_assert!(summary.flags & flag::SHALLOW != 0);
             shallow[class as usize] += 1;
         }
         if summary.flags & flag::ORGANELLAR != 0 {
             organellar += 1;
             organellar_bases += u64::from(summary.length);
         }
-        if summary.flags & flag::DEMOTED != 0 {
+        if policy.demoted(summary) {
             demoted += 1;
             demoted_bases += u64::from(summary.length);
         }
-        low_complexity += u64::from(summary.flags & flag::LOW_COMPLEXITY != 0);
-        ambiguous += u64::from(summary.flags & flag::AMBIGUOUS != 0);
+        low_complexity += u64::from(policy.low_complexity(summary));
+        ambiguous += u64::from(policy.ambiguous(summary));
 
         let occupancy = f64::from(summary.words) / WORDS as f64;
         let class = CLASSES.iter().position(|&(_, f)| occupancy >= f).unwrap();
@@ -568,6 +842,7 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
 
     Plan {
         cap: policy.cap,
+        max_length: policy.max_length,
         diversity,
         diversity_trimmed,
         demote_length: policy.demote_length as u64,
@@ -802,20 +1077,31 @@ impl Plan {
                 );
             }
         }
-        out.push_str(
-            "\n  These records are RETAINED: no --max-length is set. To act on this:\n    \
-             trim them   --oversize-list <path>   (worklist for ITSx/cmsearch)\n    \
-             or exclude  --max-length <bp>  /  --drop-organellar\n",
-        );
+        match self.max_length {
+            None => out.push_str(
+                "\n  These records are RETAINED: no --max-length is set. To act on this:\n    \
+                 trim them   --oversize-list <path>   (worklist for ITSx/cmsearch)\n    \
+                 or exclude  --max-length <bp>  /  --drop-organellar\n",
+            ),
+            Some(max) => out.push_str(&format!(
+                "\n  Records over {} bp are DROPPED (--max-length). Trimming them and \
+                 splicing\n  them back keeps their lineages; a ceiling deletes whatever \
+                 only they represent.\n",
+                thousands(max as u64)
+            )),
+        }
         Some(out)
     }
 }
 
 // --- Selection ---
 
-/// How representatives are chosen once a group exceeds the cap.
+/// How representatives are chosen. All but `Cover` act only on groups over
+/// the cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Selector {
+    /// Keep one representative per LSH neighbourhood, densest first; `--cap` is a ceiling.
+    Cover,
     /// Uniform random sample, seeded per group (default).
     Random,
     /// Farthest-point selection over k-mer sketches (favours the lineage periphery).
@@ -872,17 +1158,13 @@ impl Selection {
 
 /// Candidate order within a group: not oversize, fewest ambiguous bases,
 /// length closest to the group median, then earliest.
-fn preference(summary: &Summary, median_words: u32) -> (u8, u32, u32, u32) {
+fn preference(policy: &Policy, summary: &Summary, median_words: u32) -> (u8, u32, u32, u32) {
     (
-        u8::from(summary.flags & flag::DEMOTED != 0),
+        u8::from(policy.demoted(summary)),
         summary.ambiguous,
         summary.words.abs_diff(median_words),
         summary.ordinal,
     )
-}
-
-fn rejected(summary: &Summary) -> bool {
-    summary.flags & (flag::LOW_COMPLEXITY | flag::AMBIGUOUS | flag::OVERSIZE) != 0
 }
 
 pub fn policy_digest(policy: &Policy, selector: Selector, seed: u64) -> [u8; 32] {
@@ -895,6 +1177,7 @@ pub fn policy_digest(policy: &Policy, selector: Selector, seed: u64) -> [u8; 32]
     hasher.update(&policy.max_ambiguity.to_bits().to_le_bytes());
     hasher.update(&(policy.min_words as u64).to_le_bytes());
     hasher.update(&policy.ceiling.to_bits().to_le_bytes());
+    hasher.update(&(policy.cover_bands as u64).to_le_bytes());
     hasher.update(&(policy.shallow.covered as u64).to_le_bytes());
     hasher.update(&(policy.shallow.orphan_order as u64).to_le_bytes());
     hasher.update(&(policy.shallow.unplaced as u64).to_le_bytes());
@@ -923,10 +1206,11 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
     };
 
     // Group membership in CSR layout: one allocation instead of one Vec per group.
+    // Counts come from `Group::records`.
     let groups = survey.groups.len();
     let mut offsets = vec![0u32; groups + 1];
-    for summary in &survey.summaries {
-        offsets[survey.index_of[summary.group as usize] as usize + 1] += 1;
+    for (i, group) in survey.groups.iter().enumerate() {
+        offsets[i + 1] = group.records;
     }
     for i in 0..groups {
         offsets[i + 1] += offsets[i];
@@ -941,28 +1225,18 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
 
     // Per-group caps. Under-annotated groups get a role-specific cap, so order
     // annotation coverage must be known up front.
-    let mut order_annotated = std::collections::HashMap::<u32, u64>::new();
-    for group in &survey.groups {
-        if !survey.rank_name(group, GENUS).is_empty() {
-            *order_annotated.entry(group.path[ORDER]).or_default() += u64::from(group.records);
-        }
-    }
+    let coverage = survey.order_coverage();
     let caps: Vec<usize> = survey
         .groups
         .iter()
-        .map(|group| {
-            let shallow = survey.rank_name(group, FAMILY).is_empty()
-                && survey.rank_name(group, GENUS).is_empty();
-            if !shallow {
-                return policy.cap;
-            }
-            if survey.rank_name(group, ORDER).is_empty() {
-                policy.shallow.unplaced
-            } else if let Some(&annotated) = order_annotated.get(&group.path[ORDER]) {
-                let proportional = (annotated as f64 * policy.shallow.ratio).ceil() as usize;
+        .map(|group| match survey.shallow_class(group, &coverage) {
+            None => policy.cap,
+            Some(Shallow::Unplaced) => policy.shallow.unplaced,
+            Some(Shallow::OrphanOrder) => policy.shallow.orphan_order,
+            Some(Shallow::Covered) => {
+                let annotated = coverage[&group.path[ORDER]] as f64;
+                let proportional = (annotated * policy.shallow.ratio).ceil() as usize;
                 policy.shallow.covered.min(proportional).max(1)
-            } else {
-                policy.shallow.orphan_order
             }
         })
         .collect();
@@ -972,8 +1246,7 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
     for g in 0..groups {
         let span = &members[offsets[g] as usize..offsets[g + 1] as usize];
         let group = &survey.groups[g];
-        let shallow =
-            survey.rank_name(group, FAMILY).is_empty() && survey.rank_name(group, GENUS).is_empty();
+        let shallow = survey.shallow_class(group, &coverage).is_some();
         let organellar = is_organellar(survey.rank_name(group, DOMAIN));
         if (policy.drop_shallow && shallow) || (policy.drop_organellar && organellar) {
             selection.deliberate[g] = true;
@@ -987,11 +1260,10 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         // (a) hard rejects
         for &i in span {
             let summary = &survey.summaries[i as usize];
-            if rejected(summary) {
-                selection.counts.low_complexity +=
-                    u64::from(summary.flags & flag::LOW_COMPLEXITY != 0);
-                selection.counts.ambiguous += u64::from(summary.flags & flag::AMBIGUOUS != 0);
-                selection.counts.oversize += u64::from(summary.flags & flag::OVERSIZE != 0);
+            if policy.rejects(summary) {
+                selection.counts.low_complexity += u64::from(policy.low_complexity(summary));
+                selection.counts.ambiguous += u64::from(policy.ambiguous(summary));
+                selection.counts.oversize += u64::from(policy.oversize(summary));
                 dropped.push(i);
             } else {
                 eligible.push(i);
@@ -1018,33 +1290,43 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         if eligible.is_empty() {
             let take = cap.min(dropped.len());
             let median = median_words(survey, &dropped);
-            dropped.sort_unstable_by_key(|&i| preference(&survey.summaries[i as usize], median));
+            dropped.sort_unstable_by_key(|&i| {
+                preference(policy, &survey.summaries[i as usize], median)
+            });
             eligible.extend_from_slice(&dropped[..take]);
             selection.counts.restored += take as u64;
-            selection.counts.low_complexity = selection.counts.low_complexity.saturating_sub(
-                dropped[..take]
-                    .iter()
-                    .filter(|&&i| survey.summaries[i as usize].flags & flag::LOW_COMPLEXITY != 0)
-                    .count() as u64,
-            );
+            // Undo the drop counters for every reason a restored record was rejected,
+            // not just the first, so the manifest matches the written database.
+            for &i in &dropped[..take] {
+                let summary = &survey.summaries[i as usize];
+                let c = &mut selection.counts;
+                c.low_complexity = c
+                    .low_complexity
+                    .saturating_sub(u64::from(policy.low_complexity(summary)));
+                c.ambiguous = c
+                    .ambiguous
+                    .saturating_sub(u64::from(policy.ambiguous(summary)));
+                c.oversize = c
+                    .oversize
+                    .saturating_sub(u64::from(policy.oversize(summary)));
+            }
         }
 
-        // (d) cap
-        if eligible.len() > cap {
-            let trimmed = (eligible.len() - cap) as u64;
-            if shallow {
-                selection.counts.over_shallow_cap += trimmed;
-            } else {
-                selection.counts.over_cap += trimmed;
-            }
+        // (d) reduce to representatives. `Cover` always runs, since how many a
+        // group needs depends on the group; the others only run over the cap.
+        let before = eligible.len();
+        if selector == Selector::Cover {
+            let median = median_words(survey, &eligible);
+            select_cover(survey, policy, &mut eligible, cap, median);
+        } else if before > cap {
             let median = median_words(survey, &eligible);
             match selector {
                 Selector::Maxmin => {
-                    select_maxmin(survey, &mut eligible, cap, median, policy.ceiling);
+                    select_maxmin(survey, policy, &mut eligible, cap, median);
                 }
                 Selector::First => {
                     eligible.sort_unstable_by_key(|&i| {
-                        preference(&survey.summaries[i as usize], median)
+                        preference(policy, &survey.summaries[i as usize], median)
                     });
                 }
                 Selector::Random => {
@@ -1055,10 +1337,15 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
                         eligible.swap(i, rng.bounded(i as u64 + 1) as usize);
                     }
                 }
+                Selector::Cover => unreachable!("handled above"),
             }
-            if eligible.len() > cap {
-                eligible.truncate(cap);
-            }
+            eligible.truncate(cap);
+        }
+        let trimmed = (before - eligible.len()) as u64;
+        if shallow {
+            selection.counts.over_shallow_cap += trimmed;
+        } else {
+            selection.counts.over_cap += trimmed;
         }
 
         for &i in &eligible {
@@ -1067,6 +1354,56 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         }
     }
     selection
+}
+
+/// LSH bands a full-width sketch affords.
+///
+/// Two records share a band with probability `J^4`, so over `b` bands they
+/// match with `1 - (1 - J^4)^b`. More bands means a looser radius and more
+/// compression; four collapses pairs above about 0.8 Jaccard.
+pub const BANDS: usize = SKETCH / sketch::BAND;
+
+/// Keep one representative per LSH neighbourhood, densest neighbourhood first.
+/// Runs regardless of cap; `cap` bounds it above, group preservation below.
+fn select_cover(survey: &Survey, policy: &Policy, members: &mut Vec<u32>, cap: usize, median: u32) {
+    let bands = policy.cover_bands.clamp(1, BANDS);
+    let density = density(survey, members);
+
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let summary = &survey.summaries[members[idx] as usize];
+        (
+            // Oversize records are kept only if nothing better covers their neighbourhood.
+            u8::from(policy.demoted(summary)),
+            std::cmp::Reverse(density[idx]),
+            preference(policy, summary, median),
+        )
+    });
+
+    let mut claimed: Vec<std::collections::HashSet<u64>> = vec![Default::default(); bands];
+    let mut kept = Vec::new();
+    for idx in order {
+        let sketch = survey.summaries[members[idx] as usize].sketch;
+        // Too few words to fill a band: keep it, since coverage can't be judged. Only
+        // happens for records restored by group preservation.
+        let judgeable = sketch.band(0).is_some();
+        let covered = judgeable
+            && (0..bands).any(|b| sketch.band(b).is_some_and(|key| claimed[b].contains(&key)));
+        if covered {
+            continue;
+        }
+        for (b, claimed) in claimed.iter_mut().enumerate() {
+            if let Some(key) = sketch.band(b) {
+                claimed.insert(key);
+            }
+        }
+        kept.push(members[idx]);
+        if kept.len() >= cap {
+            break;
+        }
+    }
+    kept.sort_unstable();
+    *members = kept;
 }
 
 /// Approximate number of close relatives per member, via LSH banding.
@@ -1101,19 +1438,25 @@ fn density(survey: &Survey, members: &[u32]) -> Vec<u32> {
 
 /// Truncated greedy farthest-point selection, maximising retained k-mer
 /// coverage of the group.
-fn select_maxmin(survey: &Survey, members: &mut Vec<u32>, cap: usize, median: u32, ceiling: f32) {
+fn select_maxmin(
+    survey: &Survey,
+    policy: &Policy,
+    members: &mut Vec<u32>,
+    cap: usize,
+    median: u32,
+) {
+    let ceiling = policy.ceiling;
     let density = density(survey, members);
     let sketch_of = |i: u32| survey.summaries[i as usize].sketch;
 
     // Oversize records are picked only when nothing better is left; distance
     // alone can't tell a divergent congener from junk.
-    let sound =
-        |idx: usize| u8::from(survey.summaries[members[idx] as usize].flags & flag::DEMOTED == 0);
+    let sound = |idx: usize| u8::from(!policy.demoted(&survey.summaries[members[idx] as usize]));
 
     // Seed with a typical member: the first pick shapes everything after it.
     let seed = (0..members.len())
         .max_by_key(|&idx| {
-            let pref = preference(&survey.summaries[members[idx] as usize], median);
+            let pref = preference(policy, &survey.summaries[members[idx] as usize], median);
             (sound(idx), density[idx], std::cmp::Reverse(pref))
         })
         .unwrap();
@@ -1136,6 +1479,7 @@ fn select_maxmin(survey: &Survey, members: &mut Vec<u32>, cap: usize, median: u3
                         mind[idx].min(ceiling),
                         density[idx],
                         std::cmp::Reverse(preference(
+                            policy,
                             &survey.summaries[members[idx] as usize],
                             median,
                         )),
@@ -1283,7 +1627,12 @@ pub struct Emitted {
 
 /// Pass 2: copy the selected records in input order. Sequences are written
 /// unwrapped, one line each.
-pub fn emit(reference: &Path, output: &Path, selection: &Selection) -> Result<Emitted> {
+pub fn emit(
+    reference: &Path,
+    output: &Path,
+    selection: &Selection,
+    surveyed: u64,
+) -> Result<Emitted> {
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1318,11 +1667,19 @@ pub fn emit(reference: &Path, output: &Path, selection: &Selection) -> Result<Em
     }
     writer.flush()?;
     drop(writer);
+    // Check the total as well as the kept count: a stale --survey-cache can shift
+    // ordinals without changing how many records are kept.
+    ensure!(
+        u64::from(ordinal) == surveyed,
+        "reference holds {ordinal} records but the survey saw {surveyed}; \
+         the reference changed between passes, or --survey-cache is stale"
+    );
     ensure!(
         records == selection.kept,
         "emitted {records} records but selected {}; the reference changed between passes",
         selection.kept
     );
+    temp.as_file().sync_all()?;
     temp.persist(output)
         .with_context(|| format!("writing {}", output.display()))?;
     Ok(Emitted {
@@ -1395,7 +1752,10 @@ pub fn report(p: &Provenance) -> String {
     ));
     out.push_str(&format!(
         "  \"policy\": {{\n    \"cap\": {},\n    \"demote_length\": {},\n    \"max_length\": {},\n    \
-         \"max_ambiguity\": {},\n    \"min_words\": {},\n    \"ceiling\": {},\n    \"select\": {},\n    \"seed\": {}\n  }},\n",
+         \"max_ambiguity\": {},\n    \"min_words\": {},\n    \"ceiling\": {},\n    \
+         \"cover_bands\": {},\n    \"shallow_cap\": [{}, {}, {}],\n    \"shallow_ratio\": {},\n    \
+         \"drop_shallow\": {},\n    \"drop_organellar\": {},\n    \
+         \"select\": {},\n    \"seed\": {}\n  }},\n",
         policy.cap,
         policy.demote_length,
         policy
@@ -1404,6 +1764,13 @@ pub fn report(p: &Provenance) -> String {
         policy.max_ambiguity,
         policy.min_words,
         policy.ceiling,
+        policy.cover_bands,
+        policy.shallow.covered,
+        policy.shallow.orphan_order,
+        policy.shallow.unplaced,
+        policy.shallow.ratio,
+        policy.drop_shallow,
+        policy.drop_organellar,
         json_string(&format!("{selector:?}").to_lowercase()),
         seed
     ));
@@ -1471,7 +1838,7 @@ pub fn report(p: &Provenance) -> String {
     ));
     out.push_str(&format!(
         "  \"hazards\": {{\n    \"organellar_records\": {},\n    \"organellar_bases\": {},\n    \
-         \"oversize_records\": {},\n    \"oversize_bases\": {},\n    \
+         \"demoted_records\": {},\n    \"demoted_bases\": {},\n    \
          \"conflicting_duplicate_groups\": {},\n    \"occupancy\": [",
         plan.organellar,
         plan.organellar_bases,

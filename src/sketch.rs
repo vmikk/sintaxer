@@ -47,8 +47,17 @@ impl<const S: usize> Sketch<S> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    /// `u64` LSH key for band `band`, or `None` past the end of the sketch.
-    /// Equal keys mean `BAND` consecutive min-hashes agree.
+    /// Rebuild from [`Sketch::values`] output, for the survey cache. The tail is
+    /// padded with `u16::MAX` like [`sketch`] does, and excess input is truncated.
+    pub fn restore(values: &[u16]) -> Self {
+        let mut out = [u16::MAX; S];
+        let len = values.len().min(S);
+        out[..len].copy_from_slice(&values[..len]);
+        Self {
+            values: out,
+            len: len as u16,
+        }
+    }
     pub fn band(&self, band: usize) -> Option<u64> {
         let start = band * BAND;
         let end = start + BAND;

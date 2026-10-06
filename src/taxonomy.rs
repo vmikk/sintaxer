@@ -71,6 +71,14 @@ impl Default for TreeBuilder {
     }
 }
 impl TreeBuilder {
+    /// Rebuild from an already-interned node list (as cached by the curation survey).
+    /// The name lookup is left empty, so a restored tree must not be inserted into.
+    pub fn restore(nodes: Vec<Node>) -> Self {
+        Self {
+            nodes,
+            lookup: BTreeMap::new(),
+        }
+    }
     pub fn insert(&mut self, lineage: Lineage) -> Result<u32> {
         let mut parent = 0;
         for (rank, name) in lineage.into_iter().enumerate() {

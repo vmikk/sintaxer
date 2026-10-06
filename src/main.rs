@@ -105,6 +105,10 @@ enum Command {
         /// Sketch distance past which candidates count as equally diverse.
         #[arg(long, default_value_t = curate::DIVERSITY_CEILING)]
         ceiling: f32,
+        /// LSH bands consulted by `--select cover`, 1..=8. More bands means a looser
+        /// radius and more compression (see `curate::BANDS`).
+        #[arg(long, default_value_t = 4)]
+        cover_bands: usize,
         /// Caps for records with neither family nor genus, as
         /// covered,orphan-order,unplaced. Capped rather than dropped to guard against over-classification.
         #[arg(long, default_value = "50,50,50", value_delimiter = ',')]
@@ -121,6 +125,10 @@ enum Command {
         /// Write every label longer than --demote-length here, as a trimming worklist.
         #[arg(long)]
         oversize_list: Option<PathBuf>,
+        /// Cache the survey pass here: written if absent, reused if present. Valid for
+        /// any policy, so sweeps parse the database only once.
+        #[arg(long)]
+        survey_cache: Option<PathBuf>,
     },
     /// Read metadata, optionally verifying the entire index.
     Inspect {
@@ -411,11 +419,13 @@ fn main() -> Result<()> {
             max_ambiguity,
             min_words,
             ceiling,
+            cover_bands,
             shallow_cap,
             shallow_ratio,
             drop_shallow,
             drop_organellar,
             oversize_list,
+            survey_cache,
         } => {
             // Curation reads the input twice, so it cannot take a stream.
             ensure!(
@@ -444,6 +454,11 @@ fn main() -> Result<()> {
                 "shallow-ratio must be in 0..=1"
             );
             ensure!(
+                (1..=curate::BANDS).contains(&cover_bands),
+                "--cover-bands must be in 1..={}",
+                curate::BANDS
+            );
+            ensure!(
                 (0.0..=1.0).contains(&max_ambiguity),
                 "max-ambiguity must be in 0..=1"
             );
@@ -454,6 +469,7 @@ fn main() -> Result<()> {
                 max_ambiguity,
                 min_words,
                 ceiling,
+                cover_bands,
                 shallow: curate::ShallowCaps {
                     covered: shallow_cap[0],
                     orphan_order: shallow_cap[1],
@@ -473,11 +489,35 @@ fn main() -> Result<()> {
                 })
                 .transpose()?;
             let start = Instant::now();
-            let survey = curate::survey(
-                &reference,
-                &policy,
-                oversize.as_mut().map(|w| w as &mut dyn Write),
-            )?;
+            let cached = match survey_cache.as_deref() {
+                Some(path) => curate::load(&reference, path)?,
+                None => None,
+            };
+            // The oversize list needs labels, which the survey cache does not store.
+            ensure!(
+                !(cached.is_some() && oversize.is_some()),
+                "--oversize-list needs the labels, which a survey cache does not store; \
+                 run it without --survey-cache"
+            );
+            let survey = match cached {
+                Some(survey) => {
+                    eprintln!("survey_cache=hit records={}", survey.records);
+                    survey
+                }
+                None => {
+                    let survey = curate::survey(
+                        &reference,
+                        oversize
+                            .as_mut()
+                            .map(|w| (policy.demote_length, w as &mut dyn Write)),
+                    )?;
+                    if let Some(path) = survey_cache.as_deref() {
+                        curate::save(&survey, &reference, path)?;
+                        eprintln!("survey_cache=wrote records={}", survey.records);
+                    }
+                    survey
+                }
+            };
             if let Some(mut list) = oversize {
                 list.flush()?;
             }
@@ -504,7 +544,7 @@ fn main() -> Result<()> {
                     "group preservation failed; lineages lost: {:?}",
                     invariants.missing
                 );
-                let emitted = curate::emit(&reference, &output, &selection)?;
+                let emitted = curate::emit(&reference, &output, &selection, survey.records)?;
                 let wall = start.elapsed().as_secs_f64();
                 let manifest = report.unwrap_or_else(|| {
                     PathBuf::from(format!("{}.curation.json", output.display()))

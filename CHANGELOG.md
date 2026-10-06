@@ -1,3 +1,11 @@
+## [0.7.0]
+
+### Added
+- `curate --select cover` sizes each lineage's representative set by its own k-mer diversity. `--cover-bands` tunes it.
+- `curate --survey-cache` saves the first pass over the database and reuses it, so sweeps over curation policies are cheap.
+
+### Changed
+- The cap curve in `curate --plan` now extends to caps of 2500.
 
 ## [0.6.0]
 

@@ -18,6 +18,14 @@ pub enum Strand {
     Both,
     Plus,
 }
+/// What a per-rank confidence is a fraction of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Support {
+    /// All replicates (the published denominator).
+    Raw,
+    /// Only replicates whose winning reference is named at that rank.
+    Adjusted,
+}
 #[derive(Clone, Debug)]
 pub struct Config {
     pub seed: u64,
@@ -34,6 +42,13 @@ pub struct Config {
     pub weights: weight::Source,
     /// Percentage of occurring words treated as informative under `weights`.
     pub weight_share: u8,
+    /// Denominator for the per-rank confidence.
+    pub support: Support,
+    /// Under `Support::Adjusted`, the share of replicates that must be informative at a
+    /// rank before it is renormalized; below it the raw support is used.
+    pub min_informative: f64,
+    /// Append a fifth column holding the informative replicate count per rank.
+    pub emit_informative: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -46,6 +61,9 @@ impl Default for Config {
             risk: 0.0,
             weights: weight::Source::Off,
             weight_share: weight::DEFAULT_SHARE,
+            support: Support::Raw,
+            min_informative: 0.5,
+            emit_informative: false,
         }
     }
 }
@@ -70,6 +88,10 @@ impl Config {
             (1..=99).contains(&self.weight_share),
             "weight share must be a percentage in 1..=99"
         );
+        ensure!(
+            self.min_informative.is_finite() && (0.0..=1.0).contains(&self.min_informative),
+            "min-informative must be finite and in [0,1]"
+        );
         Ok(())
     }
 }
@@ -85,36 +107,104 @@ pub struct Timings {
     /// Bytes that were neither ACGT nor a recognised ambiguity code.
     pub unknown_bases: usize,
 }
-#[derive(Clone, Debug, PartialEq)]
+/// One rank of a prediction: the chosen taxon and the votes it drew.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankCall {
+    /// Index into [`RANKS`].
+    pub rank: u8,
+    pub name: String,
+    /// Replicates whose winning reference belonged to this node.
+    pub votes: u8,
+}
+impl RankCall {
+    pub fn code(&self) -> u8 {
+        RANKS[self.rank as usize]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prediction {
     pub strand: Option<char>,
-    pub ranks: Vec<(u8, String, u8)>,
+    pub ranks: Vec<RankCall>,
+    /// Replicates whose winning reference is named at each stored rank. Undefined at or
+    /// past `voted`.
+    pub informative: [u8; 7],
+    /// How many ranks the vote reached before running out of candidates.
+    pub voted: u8,
+    /// Ranks where the unnamed bloc matched or beat the best named taxon. Diagnostic only.
+    pub abstention_pluralities: u8,
 }
 impl Prediction {
     pub fn unclassified() -> Self {
         Self {
             strand: None,
             ranks: Vec::new(),
+            informative: [0; 7],
+            voted: 0,
+            abstention_pluralities: 0,
         }
     }
-    pub fn tsv(&self, label: &str, cutoff: f64) -> String {
+    /// Per-rank confidence under `support`, made monotone down the lineage.
+    ///
+    /// `Adjusted` alone can put a genus above its family; a running minimum restores
+    /// monotonicity so the cutoff still yields a prefix.
+    fn confidences(&self, support: Support, min_informative: f64) -> Vec<f64> {
+        let floor = min_informative * BOOTSTRAPS as f64;
+        let mut running = f64::INFINITY;
+        self.ranks
+            .iter()
+            .map(|call| {
+                let informative = f64::from(self.informative[call.rank as usize]);
+                // Too few informative replicates: keep the raw support rather than inflate a few
+                // annotated hits inside a mostly unannotated clade.
+                let value = if support == Support::Raw || informative < floor {
+                    f64::from(call.votes) / BOOTSTRAPS as f64
+                } else {
+                    // The winning named taxon's own votes are in `informative`, so this is never zero.
+                    f64::from(call.votes) / informative
+                };
+                running = running.min(value);
+                running
+            })
+            .collect()
+    }
+    pub fn tsv(&self, label: &str, config: &Config) -> String {
+        let columns = if config.emit_informative {
+            "\t\t\t\t"
+        } else {
+            "\t\t\t"
+        };
         if self.strand.is_none() {
-            return format!("{label}\t\t\t\n");
+            return format!("{label}{columns}\n");
         }
+        let confidence = self.confidences(config.support, config.min_informative);
         let full = self
             .ranks
             .iter()
-            .map(|(r, n, c)| format!("{}:{n}({:.2})", *r as char, *c as f64 / BOOTSTRAPS as f64))
+            .zip(&confidence)
+            .map(|(call, c)| format!("{}:{}({c:.2})", call.code() as char, call.name))
             .collect::<Vec<_>>()
             .join(",");
         let filtered = self
             .ranks
             .iter()
-            .filter(|(_, _, c)| *c as f64 / BOOTSTRAPS as f64 >= cutoff)
-            .map(|(r, n, _)| format!("{}:{n}", *r as char))
+            .zip(&confidence)
+            .filter(|(_, c)| **c >= config.cutoff)
+            .map(|(call, _)| format!("{}:{}", call.code() as char, call.name))
             .collect::<Vec<_>>()
             .join(",");
-        format!("{label}\t{full}\t{}\t{filtered}\n", self.strand.unwrap())
+        let mut line = format!("{label}\t{full}\t{}\t{filtered}", self.strand.unwrap());
+        if config.emit_informative {
+            line.push('\t');
+            line.push_str(
+                &(0..usize::from(self.voted))
+                    .map(|rank| format!("{}:{}", RANKS[rank] as char, self.informative[rank]))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        line.push('\n');
+        line
     }
 }
 
@@ -166,8 +256,12 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
     let lineages: Vec<_> = winners.iter().map(|r| index.lineage(*r as usize)).collect();
     let mut included = vec![true; lineages.len()];
     let mut ranks = Vec::new();
-    for (rank, &code) in RANKS.iter().enumerate() {
-        // Keyed by name. All candidates share the selected ancestor here, so names identify nodes.
+    let mut informative = [0u8; 7];
+    let mut voted = 0u8;
+    let mut abstention_pluralities = 0u8;
+    for rank in 0..RANKS.len() {
+        // Keyed by name. All candidates share the selected ancestor here, so names identify
+        // nodes, and interning leaves at most one unnamed sentinel among them.
         let mut counts = BTreeMap::<&str, (u32, u8)>::new();
         for (i, lineage) in lineages.iter().enumerate() {
             if included[i] {
@@ -175,20 +269,39 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
                 counts.entry(index.name(node)).or_insert((node, 0)).1 += 1;
             }
         }
-        let mut best = None;
+        if counts.is_empty() {
+            break;
+        }
+        voted += 1;
+        // A missing rank is an abstention, not a competing taxon. Interning merges all
+        // unannotated siblings into one node, which would otherwise outvote split named ones.
+        let mut best: Option<(&str, u32, u8)> = None;
+        let mut unnamed: Option<(&str, u32, u8)> = None;
         for (name, (node, count)) in counts {
-            if best.is_none_or(|(_, _, c)| count > c) {
-                best = Some((name, node, count));
+            if name.is_empty() {
+                unnamed = Some((name, node, count));
+            } else {
+                informative[rank] += count;
+                if best.is_none_or(|(_, _, c)| count > c) {
+                    best = Some((name, node, count));
+                }
             }
         }
-        let Some((name, node, count)) = best else {
-            break;
-        };
+        if let (Some((_, _, abstained)), Some((_, _, named))) = (unnamed, best) {
+            abstention_pluralities += u8::from(abstained >= named);
+        }
+        // No named candidate: keep the sentinel so an annotation gap can still reach a named
+        // lower rank.
+        let (name, node, count) = best.or(unnamed).expect("counts is not empty");
         for (i, lineage) in lineages.iter().enumerate() {
             included[i] &= lineage[rank] == node;
         }
         if !name.is_empty() {
-            ranks.push((code, name.to_owned(), count));
+            ranks.push(RankCall {
+                rank: rank as u8,
+                name: name.to_owned(),
+                votes: count,
+            });
         }
     }
     if ranks.is_empty() {
@@ -197,6 +310,9 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
         Prediction {
             strand: Some(strand),
             ranks,
+            informative,
+            voted,
+            abstention_pluralities,
         }
     }
 }

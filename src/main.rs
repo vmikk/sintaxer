@@ -65,6 +65,17 @@ enum Command {
         /// Percentage of the database's words treated as informative. Ignored when --weights is off.
         #[arg(long, default_value_t = weight::DEFAULT_SHARE)]
         weight_share: u8,
+        /// Denominator for per-rank confidence: `raw` counts all replicates (published
+        /// SINTAX); `adjusted` counts only replicates annotated at that rank.
+        #[arg(long, value_enum, default_value_t = classify::Support::Raw)]
+        support: classify::Support,
+        /// Minimum share of replicates informative at a rank before `--support adjusted`
+        /// renormalizes it; below this raw support is kept.
+        #[arg(long, default_value_t = 0.5)]
+        min_informative: f64,
+        /// Append a fifth column with the replicates carrying a name at each rank.
+        #[arg(long)]
+        emit_informative: bool,
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
@@ -150,6 +161,9 @@ struct BatchResult {
     reads: usize,
     bases: usize,
     escalated: usize,
+    /// Queries with a rank where the unnamed bloc matched or beat the best named
+    /// taxon; the ranks `--support adjusted` acts on.
+    contested: usize,
     timings: Timings,
 }
 
@@ -165,15 +179,17 @@ fn process(
         reads: 0,
         bases: 0,
         escalated: 0,
+        contested: 0,
         timings: Timings::default(),
     };
     for record in batch {
         let (prediction, times) =
             classify::classify(index, &record.sequence, config, weights, workspace)
                 .with_context(|| format!("query {:?}", record.label))?;
+        result.contested += usize::from(prediction.abstention_pluralities > 0);
         result
             .output
-            .push_str(&prediction.tsv(&record.label, config.cutoff));
+            .push_str(&prediction.tsv(&record.label, config));
         result.reads += 1;
         result.bases += record.sequence.len();
         result.escalated += usize::from(times.escalated);
@@ -224,6 +240,7 @@ fn run_classify(
     };
     let mut writer = BufWriter::with_capacity(256 * 1024, sink);
     let (mut total_reads, mut total_bases, mut escalated) = (0usize, 0usize, 0usize);
+    let mut contested = 0usize;
     let mut totals = Timings::default();
     let (mut parsing, mut writing) = (Duration::ZERO, Duration::ZERO);
     let mut first_result = None;
@@ -308,6 +325,7 @@ fn run_classify(
                     total_reads += result.reads;
                     total_bases += result.bases;
                     escalated += result.escalated;
+                    contested += result.contested;
                     totals.extraction += result.timings.extraction;
                     totals.sampling += result.timings.sampling;
                     totals.scoring += result.timings.scoring;
@@ -355,6 +373,16 @@ fn run_classify(
             "escalated_queries={escalated} escalated_pct={:.3}",
             if total_reads > 0 {
                 100.0 * escalated as f64 / total_reads as f64
+            } else {
+                0.0
+            }
+        );
+        // How often unannotated references held a rank against the best named
+        // candidate (`--emit-informative` gives per-query detail).
+        eprintln!(
+            "abstention_contested_queries={contested} abstention_contested_pct={:.3}",
+            if total_reads > 0 {
+                100.0 * contested as f64 / total_reads as f64
             } else {
                 0.0
             }
@@ -618,6 +646,9 @@ fn main() -> Result<()> {
             risk,
             weights,
             weight_share,
+            support,
+            min_informative,
+            emit_informative,
             profile,
         } => {
             run_classify(
@@ -634,6 +665,9 @@ fn main() -> Result<()> {
                     risk,
                     weights,
                     weight_share,
+                    support,
+                    min_informative,
+                    emit_informative,
                 },
                 profile,
             )?;

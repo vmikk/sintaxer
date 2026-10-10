@@ -238,6 +238,7 @@ impl Index {
         );
         // SAFETY: read-only mapping. Published indexes are never modified in place;
         // the builder replaces them atomically with a new inode.
+        #[expect(unsafe_code, reason = "read-only mapping; see SAFETY above")]
         let map = unsafe { Mmap::map(&file)? };
         ensure!(&map[..8] == MAGIC, "not a Sintaxer index");
         ensure!(
@@ -402,7 +403,7 @@ impl Index {
                     ones == row.count,
                     "bitmap cardinality mismatch for word {word}"
                 );
-                if self.references % 8 != 0 {
+                if !self.references.is_multiple_of(8) {
                     ensure!(
                         row.data.last().unwrap() >> (self.references % 8) == 0,
                         "nonzero bitmap tail"
@@ -771,6 +772,7 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     let mut out = tempfile::NamedTempFile::new_in(parent)?;
     out.as_file_mut().set_len(total)?;
     // SAFETY: a freshly created private temporary file that we own exclusively.
+    #[expect(unsafe_code, reason = "exclusively owned temporary; see SAFETY above")]
     let mut map = unsafe { MmapMut::map_mut(out.as_file())? };
     map[..8].copy_from_slice(MAGIC);
     put32(&mut map, 8, FORMAT_VERSION);

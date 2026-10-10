@@ -2,7 +2,7 @@
 name = "sintaxer"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "Deterministic, indexed SINTAX-style amplicon taxonomy classification"
 license = "MIT"
 
@@ -10,10 +10,18 @@ license = "MIT"
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+# zlib-rs is noticeably faster than miniz_oxide for gzipped input
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 memmap2 = "0.9"
 needletail = { version = "0.7.3", default-features = false, features = ["flate2", "zstd"] }
 tempfile = "3"
 
+[lints.rust]
+# the only unsafe code is the two mmap calls
+unsafe_code = "deny"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# keep line tables for profiling
+debug = "line-tables-only"

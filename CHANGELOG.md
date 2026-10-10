@@ -1,4 +1,14 @@
-## [0.7.0]
+
+## [0.8.0]
+
+### Added
+- `--support raw|adjusted` sets the confidence denominator. `adjusted` counts only replicates that name the rank, and `--min-informative` fences it.
+- `--emit-informative` appends a column with the number of informative replicates at each rank.
+- `--profile` reports how many queries had a rank contested by unannotated references.
+
+### Changed
+- References with no name at a rank now abstain from that rank's vote instead of competing as one unnamed bloc. This changes calls on under-annotated databases.
+
 
 ### Added
 - `curate --select cover` sizes each lineage's representative set by its own k-mer diversity. `--cover-bands` tunes it.

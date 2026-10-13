@@ -76,6 +76,9 @@ fn plane_max(planes: &[u64], lanes: usize, depth: usize, valid: &[u64]) -> (u32,
 }
 
 /// Per-worker scratch buffers, reused across queries.
+///
+/// The replicate path still allocates one small `Vec` per [`plane_max`] call,
+/// owned by the resulting [`Top`]; this is cheap enough to leave as is.
 pub struct Workspace {
     planes: Vec<u64>,
     tile: Vec<u64>,
@@ -160,21 +163,20 @@ impl Workspace {
                     0,
                 );
             }
+            // Visit only set bits: `counts` is already zeroed, and the high planes are sparse.
             for lane in 0..lanes {
-                // Skip lanes of 64 references that share no word with the query.
-                if (0..depth).all(|p| self.planes[p * lanes + lane] == 0) {
-                    continue;
-                }
-                for bit in 0..64 {
-                    let reference = start + lane * 64 + bit;
-                    if reference >= n {
-                        break;
+                let base = start + lane * 64;
+                let limit = n - base;
+                for plane in 0..depth {
+                    let mut bits = self.planes[plane * lanes + lane];
+                    if limit < 64 {
+                        bits &= (1u64 << limit) - 1;
                     }
-                    let mut value = 0u16;
-                    for plane in 0..depth {
-                        value |= (((self.planes[plane * lanes + lane] >> bit) & 1) as u16) << plane;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        self.counts[base + bit] |= 1u16 << plane;
+                        bits &= bits - 1;
                     }
-                    self.counts[reference] = value;
                 }
             }
             start += TILE;
@@ -283,7 +285,7 @@ impl Workspace {
         let used = self.candidates.len();
         if used == 0 {
             self.valid[lanes - 1] = 0;
-        } else if used % 64 != 0 {
+        } else if !used.is_multiple_of(64) {
             self.valid[lanes - 1] = (1u64 << (used % 64)) - 1;
         }
         let (max, bits) = plane_max(&self.candidate_planes, lanes, depth, &self.valid);

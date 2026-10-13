@@ -464,13 +464,14 @@ fn main() -> Result<()> {
                 plan != output.is_some(),
                 "pass either --output <fasta> or --plan, not both"
             );
-            if let (Some(output), true) = (output.as_deref(), reference.exists()) {
-                if output.exists() {
-                    ensure!(
-                        std::fs::canonicalize(&reference)? != std::fs::canonicalize(output)?,
-                        "curated output must differ from reference input"
-                    );
-                }
+            if let Some(output) = output.as_deref()
+                && reference.exists()
+                && output.exists()
+            {
+                ensure!(
+                    std::fs::canonicalize(&reference)? != std::fs::canonicalize(output)?,
+                    "curated output must differ from reference input"
+                );
             }
             ensure!(cap > 0, "cap must be at least 1");
             ensure!(

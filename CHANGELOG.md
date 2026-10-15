@@ -1,5 +1,15 @@
 
-## [0.8.0]
+## [0.9.0]
+
+### Changed
+- MSRV raised to Rust 1.90.
+- Builds target x86-64-v2 by default, set in `.cargo/config.toml`.
+- Gzip input is decompressed through zlib-rs rather than miniz_oxide.
+- Release builds keep line-table debug info, and `unsafe` code is denied outside the two mmap call sites.
+
+### Performance
+- The rank pass converts its counter planes by walking only the set bits, which is a little faster on large databases.
+
 
 ### Added
 - `--support raw|adjusted` sets the confidence denominator. `adjusted` counts only replicates that name the rank, and `--min-informative` fences it.

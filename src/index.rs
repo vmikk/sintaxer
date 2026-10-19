@@ -13,13 +13,18 @@ const HEADER: usize = 256;
 /// Word-directory record: offset, length, df, layout, distinct genera, distinct families.
 const ENTRY: usize = 32;
 const NODE: usize = 24;
+/// Per-node aggregates: references, named children, genus-rank descendants (three u32).
+const NODE_STAT: usize = 12;
 const MAGIC: &[u8; 8] = b"SINTAXER";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 // Header slots for the packed sequence sections.
 const H_SEQ_DIR: usize = 160;
 const H_SEQ_PAYLOAD: usize = 168;
 const H_SEQ_LEN: usize = 176;
+// Header slots for the vocabulary and node-statistics sections.
+const H_VOCAB: usize = 184;
+const H_NODE_STATS: usize = 192;
 fn u32_at(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
 }
@@ -94,6 +99,42 @@ fn sweep_taxa(
     (genera, families)
 }
 
+/// Per-node reference counts, named-child counts, and genus-rank descendant counts.
+///
+/// Computed in one reverse sweep, relying on `parent < node`. `references` counts
+/// every reference under a node, hit or not; the unnamed sentinel is not a child.
+struct NodeStats {
+    references: Vec<u32>,
+    children: Vec<u32>,
+    genera: Vec<u32>,
+}
+
+impl NodeStats {
+    fn compute(
+        leaves: impl Iterator<Item = u32>,
+        parents: &[u32],
+        ranks: &[u8],
+        named: &[bool],
+    ) -> Self {
+        let nodes = parents.len();
+        let mut stats = Self {
+            references: vec![0u32; nodes],
+            children: vec![0u32; nodes],
+            genera: ranks.iter().map(|&r| u32::from(r == 6)).collect(),
+        };
+        for leaf in leaves {
+            stats.references[leaf as usize] += 1;
+        }
+        for node in (1..nodes).rev() {
+            let parent = parents[node] as usize;
+            stats.children[parent] += u32::from(named[node]);
+            stats.references[parent] += stats.references[node];
+            stats.genera[parent] += stats.genera[node];
+        }
+        stats
+    }
+}
+
 pub struct Index {
     map: Mmap,
     pub references: usize,
@@ -104,6 +145,8 @@ pub struct Index {
     seq_dir: usize,
     seq_payload: usize,
     seq_len: usize,
+    vocab_offset: usize,
+    node_stats_offset: usize,
     validated: Vec<AtomicBool>,
 }
 
@@ -307,8 +350,25 @@ impl Index {
             .checked_add(seq_len)
             .context("sequence payload overflow")?;
         ensure!(seq_end <= map.len(), "sequence payload beyond file");
+        let vocab_offset = usize::try_from(u64_at(&map, H_VOCAB))?;
+        let node_stats_offset = usize::try_from(u64_at(&map, H_NODE_STATS))?;
         ensure!(
-            payload as u64 == align64(seq_end as u64) && payload <= map.len(),
+            vocab_offset as u64 == align64(seq_end as u64),
+            "invalid vocabulary section"
+        );
+        let vocab_end = vocab_offset
+            .checked_add(references * 2)
+            .context("vocabulary section overflow")?;
+        ensure!(
+            node_stats_offset as u64 == align64(vocab_end as u64),
+            "invalid node statistics section"
+        );
+        let node_stats_end = node_stats_offset
+            .checked_add(nodes * NODE_STAT)
+            .context("node statistics overflow")?;
+        ensure!(node_stats_end <= map.len(), "node statistics beyond file");
+        ensure!(
+            payload as u64 == align64(node_stats_end as u64) && payload <= map.len(),
             "invalid payload section"
         );
         let mut next = payload as u64;
@@ -344,6 +404,8 @@ impl Index {
             seq_dir,
             seq_payload,
             seq_len,
+            vocab_offset,
+            node_stats_offset,
             validated: (0..WORDS).map(|_| AtomicBool::new(false)).collect(),
         };
         for node in 0..nodes {
@@ -533,9 +595,15 @@ impl Index {
         let mut seen = [0u64; WORDS / 64];
         let mut counts = vec![0u32; WORDS];
         for reference in 0..self.references {
+            let mut distinct = 0u32;
             self.reference_words(reference, &mut seen, |word| {
                 counts[word as usize] += 1;
+                distinct += 1;
             })?;
+            ensure!(
+                distinct.min(u32::from(u16::MAX)) == self.vocabulary(reference),
+                "stored vocabulary size is wrong for reference {reference}"
+            );
         }
         for (word, &count) in counts.iter().enumerate() {
             ensure!(
@@ -556,6 +624,28 @@ impl Index {
                 genera[word] == self.genus_frequency(word as u16)
                     && families[word] == self.family_frequency(word as u16),
                 "directory and postings disagree on taxon counts for word {word}"
+            );
+        }
+        // The aggregates derive from already-checked leaves and parents, so a mismatch
+        // means the stored section is corrupt.
+        let parents: Vec<u32> = (0..self.nodes).map(|n| self.parent(n as u32)).collect();
+        let ranks: Vec<u8> = (0..self.nodes).map(|n| self.node_rank(n as u32)).collect();
+        let named: Vec<bool> = (0..self.nodes)
+            .map(|n| !self.name(n as u32).is_empty())
+            .collect();
+        let stats = NodeStats::compute(
+            (0..self.references).map(|r| self.leaf(r)),
+            &parents,
+            &ranks,
+            &named,
+        );
+        for node in 0..self.nodes {
+            let n = node as u32;
+            ensure!(
+                stats.references[node] == self.node_references(n)
+                    && stats.children[node] == self.node_children(n)
+                    && stats.genera[node] == self.node_genera(n),
+                "stored node statistics are wrong for node {node}"
             );
         }
         Ok(())
@@ -635,6 +725,34 @@ impl Index {
     pub fn name(&self, node: u32) -> &str {
         std::str::from_utf8(self.name_bytes(node)).expect("validated taxonomy")
     }
+    /// Distinct k-mers held by one reference, saturating at `u16::MAX`.
+    ///
+    /// `vocabulary(r) / WORDS` is the chance a reference contains an arbitrary word.
+    pub fn vocabulary(&self, reference: usize) -> u32 {
+        let p = self.vocab_offset + reference * 2;
+        u32::from(u16::from_le_bytes(self.map[p..p + 2].try_into().unwrap()))
+    }
+    /// References anywhere under `node`, including the node's own leaves.
+    pub fn node_references(&self, node: u32) -> u32 {
+        u32_at(
+            &self.map,
+            self.node_stats_offset + node as usize * NODE_STAT,
+        )
+    }
+    /// Immediate named children of `node`; the unnamed sentinel is not counted.
+    pub fn node_children(&self, node: u32) -> u32 {
+        u32_at(
+            &self.map,
+            self.node_stats_offset + node as usize * NODE_STAT + 4,
+        )
+    }
+    /// Genus-rank nodes under `node`; one if `node` is itself a genus.
+    pub fn node_genera(&self, node: u32) -> u32 {
+        u32_at(
+            &self.map,
+            self.node_stats_offset + node as usize * NODE_STAT + 8,
+        )
+    }
     pub fn lineage(&self, reference: usize) -> [u32; 7] {
         let mut lineage = [0; 7];
         let mut node = self.leaf(reference);
@@ -643,6 +761,49 @@ impl Index {
             node = self.parent(node);
         }
         lineage
+    }
+}
+
+/// Maps a written lineage back to index nodes.
+///
+/// The index only stores parent links; training needs the downward lookup,
+/// so this is built only when requested.
+pub struct Locator {
+    nodes: std::collections::HashMap<(u32, u8, Box<str>), u32>,
+}
+
+impl Locator {
+    pub fn build(index: &Index) -> Self {
+        let mut nodes = std::collections::HashMap::with_capacity(index.nodes);
+        for node in 1..index.nodes as u32 {
+            nodes.insert(
+                (
+                    index.parent(node),
+                    index.node_rank(node),
+                    index.name(node).into(),
+                ),
+                node,
+            );
+        }
+        Self { nodes }
+    }
+    /// The node at each rank the lineage names, as far as the tree agrees.
+    ///
+    /// Stops at the first rank not found under the already-resolved parent.
+    pub fn locate(&self, lineage: &crate::taxonomy::Lineage) -> [Option<u32>; 7] {
+        let mut out = [None; 7];
+        let mut parent = 0u32;
+        for (rank, name) in lineage.iter().enumerate() {
+            let name = name.as_deref().unwrap_or("");
+            match self.nodes.get(&(parent, rank as u8, name.into())) {
+                Some(&node) => {
+                    out[rank] = Some(node);
+                    parent = node;
+                }
+                None => break,
+            }
+        }
+        out
     }
 }
 
@@ -699,6 +860,7 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         BufWriter::with_capacity(1024 * 1024, File::create(tempdir.path().join("sequences"))?);
     let mut seq_offsets: Vec<u64> = vec![0];
     let mut seq_total: u64 = 0;
+    let mut vocabulary: Vec<u16> = Vec::new();
     let mut leaves = Vec::new();
     let mut tree = TreeBuilder::default();
     let mut source = blake3::Hasher::new();
@@ -716,6 +878,7 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         unknown_bases += unknown;
         unknown_records += usize::from(unknown > 0);
         let words = sequence::unique_words(&seq);
+        vocabulary.push(u16::try_from(words.len()).unwrap_or(u16::MAX));
         let id = u32::try_from(leaves.len()).context("too many reference sequences")?;
         ensure!(id < u32::MAX, "reference count exceeds format limit");
         leaves.push(tree.insert(tax)?);
@@ -754,7 +917,9 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     let strings_len: u64 = tree.nodes.iter().map(|n| n.name.len() as u64).sum();
     let seq_dir = align64(strings_offset + strings_len);
     let seq_payload = align64(seq_dir + (n as u64 + 1) * 8);
-    let payload = align64(seq_payload + seq_total);
+    let vocab_offset = align64(seq_payload + seq_total);
+    let node_stats_offset = align64(vocab_offset + n as u64 * 2);
+    let payload = align64(node_stats_offset + tree.nodes.len() as u64 * NODE_STAT as u64);
     let mut offsets = vec![0u64; WORDS];
     let mut dense = vec![false; WORDS];
     let mut total = payload;
@@ -790,6 +955,8 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         (H_SEQ_DIR as u64, seq_dir),
         (H_SEQ_PAYLOAD as u64, seq_payload),
         (H_SEQ_LEN as u64, seq_total),
+        (H_VOCAB as u64, vocab_offset),
+        (H_NODE_STATS as u64, node_stats_offset),
     ] {
         put64(&mut map, p as usize, v);
     }
@@ -810,8 +977,24 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         put32(&mut map, p + 16, counts[w]);
         map[p + 20] = u8::from(dense[w]);
     }
-    for (i, leaf) in leaves.into_iter().enumerate() {
+    for (i, &leaf) in leaves.iter().enumerate() {
         put32(&mut map, refs_offset as usize + i * 4, leaf);
+    }
+    for (i, size) in vocabulary.iter().enumerate() {
+        let p = vocab_offset as usize + i * 2;
+        map[p..p + 2].copy_from_slice(&size.to_le_bytes());
+    }
+    {
+        let parents: Vec<u32> = tree.nodes.iter().map(|n| n.parent).collect();
+        let ranks: Vec<u8> = tree.nodes.iter().map(|n| n.rank).collect();
+        let named: Vec<bool> = tree.nodes.iter().map(|n| !n.name.is_empty()).collect();
+        let stats = NodeStats::compute(leaves.iter().copied(), &parents, &ranks, &named);
+        for node in 0..tree.nodes.len() {
+            let p = node_stats_offset as usize + node * NODE_STAT;
+            put32(&mut map, p, stats.references[node]);
+            put32(&mut map, p + 4, stats.children[node]);
+            put32(&mut map, p + 8, stats.genera[node]);
+        }
     }
     let mut name_offset = 0;
     for (i, node) in tree.nodes.iter().enumerate() {

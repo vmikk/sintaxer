@@ -190,6 +190,25 @@ impl Workspace {
         Ok(())
     }
 
+    /// Erase references the caller rejects, as if they were never indexed.
+    ///
+    /// Used in training to hide the query's own sequence, genus or family from the
+    /// database without rebuilding it. A zeroed count can never be selected, so
+    /// that is enough; the histogram is rebuilt for `select` and `Bound`.
+    /// The predicate gets the count as well as the id to avoid borrowing `self`.
+    pub fn exclude(&mut self, mut rejected: impl FnMut(usize, u16) -> bool) -> usize {
+        let mut erased = 0;
+        for (reference, count) in self.counts.iter_mut().enumerate() {
+            if *count > 0 && rejected(reference, *count) {
+                self.histogram[*count as usize] -= 1;
+                self.histogram[0] += 1;
+                *count = 0;
+                erased += 1;
+            }
+        }
+        erased
+    }
+
     /// Smallest threshold whose `{r : count(r) >= threshold}` holds at least
     /// `target` references, and that set in ascending order.
     ///

@@ -3,6 +3,7 @@ pub mod classify;
 pub mod curate;
 pub mod index;
 pub mod input;
+pub mod protax;
 pub mod rank;
 pub mod rng;
 pub mod scoring;
@@ -16,7 +17,7 @@ pub const ALGORITHM_VERSION: u32 = 1;
 ///
 /// Separate from [`ALGORITHM_VERSION`], which also keys every bootstrap draw,
 /// so behaviour changes don't re-key draws with the new options off.
-pub const CLASSIFIER_VERSION: u32 = 3;
+pub const CLASSIFIER_VERSION: u32 = 4;
 pub const K: usize = 8;
 pub const WORDS: usize = 1 << (2 * K);
 pub const BOOTSTRAPS: usize = 100;

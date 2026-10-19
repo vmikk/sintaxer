@@ -1,12 +1,13 @@
 use crate::{
     BOOTSTRAPS, SAMPLE_SIZE, WORDS,
-    index::Index,
+    index::{Index, Locator},
+    protax,
     rank::{self, Bound},
-    rng, scoring, sequence,
+    rng, scoring, sequence, taxonomy,
     taxonomy::RANKS,
     weight,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
 use std::{
     collections::BTreeMap,
@@ -18,6 +19,52 @@ pub enum Strand {
     Both,
     Plus,
 }
+/// Which decision rule turns the scored references into a lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Scorer {
+    /// Published SINTAX: per-rank plurality vote over the replicate winners.
+    Sintax,
+    /// PROTAX-style per-rank logistic model with a novel-taxon outcome; needs `--protax-params`.
+    Protax,
+}
+/// Part of the database hidden from each query, for training and validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Holdout {
+    /// References with exactly the query's k-mer set (the query itself and duplicates).
+    #[value(name = "self")]
+    Identical,
+    /// The query's whole domain.
+    D,
+    /// The query's whole kingdom.
+    K,
+    /// The query's whole phylum.
+    P,
+    /// The query's whole class.
+    C,
+    /// The query's whole order.
+    O,
+    /// The query's whole family.
+    F,
+    /// The query's whole genus.
+    G,
+}
+
+impl Holdout {
+    /// The rank whose node is hidden, or `None` for [`Holdout::Identical`].
+    pub fn rank(self) -> Option<usize> {
+        match self {
+            Self::Identical => None,
+            Self::D => Some(0),
+            Self::K => Some(1),
+            Self::P => Some(2),
+            Self::C => Some(3),
+            Self::O => Some(4),
+            Self::F => Some(5),
+            Self::G => Some(6),
+        }
+    }
+}
+
 /// What a per-rank confidence is a fraction of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Support {
@@ -49,6 +96,15 @@ pub struct Config {
     pub min_informative: f64,
     /// Append a fifth column holding the informative replicate count per rank.
     pub emit_informative: bool,
+    /// Decision rule. `Sintax` is the published one.
+    pub scorer: Scorer,
+    /// Smallest cumulative probability worth descending below (PROTAX `prob_th`).
+    /// Ignored under `Scorer::Sintax`.
+    pub floor: f64,
+    /// Hide part of the database from each query, for training and validation.
+    pub holdout: Option<Holdout>,
+    /// Write design-matrix rows instead of calls.
+    pub emit_features: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -64,6 +120,10 @@ impl Default for Config {
             support: Support::Raw,
             min_informative: 0.5,
             emit_informative: false,
+            scorer: Scorer::Sintax,
+            floor: 0.001,
+            holdout: None,
+            emit_features: false,
         }
     }
 }
@@ -91,6 +151,28 @@ impl Config {
         ensure!(
             self.min_informative.is_finite() && (0.0..=1.0).contains(&self.min_informative),
             "min-informative must be finite and in [0,1]"
+        );
+        ensure!(
+            self.floor.is_finite() && (0.0..1.0).contains(&self.floor),
+            "probability floor must be finite and in [0,1)"
+        );
+        // Hiding zeroes counts that the exact path never reads, so it would silently hide nothing.
+        ensure!(
+            self.holdout.is_none() || !self.exact,
+            "--holdout cannot be combined with --exact: the exact path scores \
+             from the posting lists and would not hide anything"
+        );
+        ensure!(
+            !self.emit_features || self.holdout.is_some(),
+            "--emit-features needs --holdout: without it every query can see \
+             its own reference and every row would be fitted to a self-match"
+        );
+        // These describe the replicate vote, which the protax scorer does not have.
+        ensure!(
+            self.scorer == Scorer::Sintax
+                || (self.support == Support::Raw && !self.emit_informative),
+            "--support and --emit-informative describe the replicate vote and \
+             do not apply to --scorer protax"
         );
         Ok(())
     }
@@ -122,7 +204,8 @@ impl RankCall {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Eq`: protax columns are floats.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prediction {
     pub strand: Option<char>,
     pub ranks: Vec<RankCall>,
@@ -133,6 +216,11 @@ pub struct Prediction {
     pub voted: u8,
     /// Ranks where the unnamed bloc matched or beat the best named taxon. Diagnostic only.
     pub abstention_pluralities: u8,
+    /// Probabilities under `Scorer::Protax`, parallel to `ranks`; empty under `Scorer::Sintax`.
+    pub probabilities: Vec<f64>,
+    /// Probability that the query belongs to no named child of this rank's parent,
+    /// parallel to `ranks` and on the same scale as `probabilities`.
+    pub novel: Vec<f64>,
 }
 impl Prediction {
     pub fn unclassified() -> Self {
@@ -142,6 +230,8 @@ impl Prediction {
             informative: [0; 7],
             voted: 0,
             abstention_pluralities: 0,
+            probabilities: Vec::new(),
+            novel: Vec::new(),
         }
     }
     /// Per-rank confidence under `support`, made monotone down the lineage.
@@ -149,6 +239,10 @@ impl Prediction {
     /// `Adjusted` alone can put a genus above its family; a running minimum restores
     /// monotonicity so the cutoff still yields a prefix.
     fn confidences(&self, support: Support, min_informative: f64) -> Vec<f64> {
+        // Protax probabilities multiply down the path, so they are already monotone.
+        if !self.probabilities.is_empty() {
+            return self.probabilities.clone();
+        }
         let floor = min_informative * BOOTSTRAPS as f64;
         let mut running = f64::INFINITY;
         self.ranks
@@ -169,11 +263,9 @@ impl Prediction {
             .collect()
     }
     pub fn tsv(&self, label: &str, config: &Config) -> String {
-        let columns = if config.emit_informative {
-            "\t\t\t\t"
-        } else {
-            "\t\t\t"
-        };
+        let extra =
+            usize::from(config.emit_informative) + usize::from(config.scorer == Scorer::Protax);
+        let columns = "\t".repeat(3 + extra);
         if self.strand.is_none() {
             return format!("{label}{columns}\n");
         }
@@ -194,6 +286,19 @@ impl Prediction {
             .collect::<Vec<_>>()
             .join(",");
         let mut line = format!("{label}\t{full}\t{}\t{filtered}", self.strand.unwrap());
+        if config.scorer == Scorer::Protax {
+            // Novel-taxon probability, reported separately from the confidence.
+            line.push('\t');
+            line.push_str(
+                &self
+                    .ranks
+                    .iter()
+                    .zip(&self.novel)
+                    .map(|(call, p)| format!("{}:{p:.3}", call.code() as char))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         if config.emit_informative {
             line.push('\t');
             line.push_str(
@@ -211,6 +316,7 @@ impl Prediction {
 /// Per-worker scratch, reused across queries.
 pub struct Workspace {
     rank: rank::Workspace,
+    protax: protax::Workspace,
     scores: Vec<u8>,
     forward: Vec<u16>,
     reverse: Vec<u16>,
@@ -221,6 +327,7 @@ impl Default for Workspace {
     fn default() -> Self {
         Self {
             rank: rank::Workspace::default(),
+            protax: protax::Workspace::default(),
             scores: Vec::new(),
             forward: Vec::new(),
             reverse: Vec::new(),
@@ -247,6 +354,42 @@ struct Outcome {
     max: u8,
     winners: Vec<u32>,
     escalated: bool,
+    /// Scored references for [`Scorer::Protax`]: the candidate set plus any replicate winner
+    /// outside it. Empty under [`Scorer::Sintax`]. Collected per strand, because the rank
+    /// pass overwrites its counts on the next strand.
+    hits: Vec<protax::Hit>,
+}
+
+/// The candidate set as PROTAX similarities, with outside replicate winners folded in.
+fn protax_hits(
+    index: &Index,
+    ws: &Workspace,
+    vocabulary: usize,
+    winners: &[u32],
+) -> Vec<protax::Hit> {
+    let similarity =
+        |r: u32| protax::similarity(index, r as usize, ws.rank.counts[r as usize], vocabulary);
+    let mut hits: Vec<protax::Hit> = ws
+        .rank
+        .candidates
+        .iter()
+        .map(|&reference| protax::Hit {
+            reference,
+            similarity: similarity(reference),
+        })
+        .collect();
+    let mut extra: Vec<u32> = winners
+        .iter()
+        .copied()
+        .filter(|w| ws.rank.candidates.binary_search(w).is_err())
+        .collect();
+    extra.sort_unstable();
+    extra.dedup();
+    hits.extend(extra.into_iter().map(|reference| protax::Hit {
+        reference,
+        similarity: similarity(reference),
+    }));
+    hits
 }
 
 pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
@@ -313,6 +456,8 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
             informative,
             voted,
             abstention_pluralities,
+            probabilities: Vec::new(),
+            novel: Vec::new(),
         }
     }
 }
@@ -351,6 +496,53 @@ fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabul
     risk
 }
 
+/// One query's hidden set, resolved against the index.
+#[derive(Clone, Copy, Debug)]
+pub enum Hide {
+    /// References holding exactly the query's k-mers: all of its words and no others.
+    Identical,
+    /// Everything under one node.
+    Clade { node: u32, rank: usize },
+}
+
+impl Hide {
+    /// Whether one reference is hidden. `Clade` walks up from the leaf.
+    fn rejects(&self, index: &Index, reference: usize, count: u16, vocabulary: usize) -> bool {
+        match *self {
+            Self::Identical => {
+                usize::from(count) == vocabulary
+                    && index.vocabulary(reference) as usize == vocabulary
+            }
+            Self::Clade { node, rank } => {
+                let mut current = index.leaf(reference);
+                for _ in rank..6 {
+                    current = index.parent(current);
+                }
+                current == node
+            }
+        }
+    }
+}
+
+/// Resolve `--holdout` against one query's own annotation.
+///
+/// `None` when there is nothing to hide: no holdout, or the query has no taxon (or an
+/// unknown one) at that rank.
+pub fn hide_for(config: &Config, locator: &Locator, label: &str) -> Result<Option<Hide>> {
+    let Some(holdout) = config.holdout else {
+        return Ok(None);
+    };
+    let Some(rank) = holdout.rank() else {
+        return Ok(Some(Hide::Identical));
+    };
+    let lineage = taxonomy::parse(label)
+        .with_context(|| format!("--holdout needs a tax= annotation on query {label:?}"))?;
+    if lineage[rank].is_none() {
+        return Ok(None);
+    }
+    Ok(locator.locate(&lineage)[rank].map(|node| Hide::Clade { node, rank }))
+}
+
 /// Score every replicate of one strand, exactly or against candidates.
 #[allow(clippy::too_many_arguments)]
 fn score_strand(
@@ -361,17 +553,25 @@ fn score_strand(
     strand: u8,
     config: &Config,
     weights: &weight::Table,
+    hide: Option<Hide>,
     ws: &mut Workspace,
 ) -> Result<Outcome> {
     let mut escalated = false;
     // With a candidate set that is a large share of the database, the rank pass and
     // projection cost more than scoring everything, so small databases go exact.
-    let worth_it = !config.exact && index.references > config.candidates.saturating_mul(4);
+    // Hiding only works on the candidate path, so it always takes it.
+    let worth_it =
+        (!config.exact && index.references > config.candidates.saturating_mul(4)) || hide.is_some();
     let mut from_candidates = worth_it;
     let mut tops = if !worth_it {
         exact_tops(index, words, samples, weights, ws)?
     } else {
         ws.rank.rank(index, words)?;
+        if let Some(hide) = hide {
+            let vocabulary = words.len();
+            ws.rank
+                .exclude(|reference, count| hide.rejects(index, reference, count, vocabulary));
+        }
         // Widen the candidate set a couple of times at most, then fall back to the exact
         // path. Worst case is one rank pass plus one exact scan.
         let ceiling = config.candidates.saturating_mul(64).min(index.references);
@@ -398,6 +598,10 @@ fn score_strand(
             }
             escalated = true;
             if oversized || unseparated || target >= ceiling || threshold <= 1 {
+                if hide.is_some() {
+                    // The exact fallback ignores hiding, so keep the candidate result.
+                    break tops;
+                }
                 from_candidates = false;
                 break exact_tops(index, words, samples, weights, ws)?;
             }
@@ -420,36 +624,48 @@ fn score_strand(
             });
         }
     }
+    // Protax needs the whole-vocabulary counts, which the exact path never computes.
+    // Re-selecting also keeps the feature window the same size after an escalation.
+    let hits = if config.scorer == Scorer::Protax || config.emit_features {
+        if !worth_it {
+            ws.rank.rank(index, words)?;
+        }
+        ws.rank.select(config.candidates);
+        protax_hits(index, ws, words.len(), &winners)
+    } else {
+        Vec::new()
+    };
     Ok(Outcome {
         max,
         winners,
         escalated,
+        hits,
     })
 }
 
-pub fn classify(
+/// Score both strands and keep the better, with everything a scorer reads.
+///
+/// Shared by classification and training-row emission so both see the same evidence.
+/// `Ok(None)` means the query has too few distinct words to sample from.
+fn best_strand(
     index: &Index,
     sequence: &[u8],
     config: &Config,
     weights: &weight::Table,
+    hide: Option<Hide>,
     ws: &mut Workspace,
-) -> Result<(Prediction, Timings)> {
-    config.validate()?;
-    ensure!(
-        weights.source() == config.weights,
-        "weight table does not match the configured source"
-    );
-    let mut timings = Timings::default();
+    timings: &mut Timings,
+) -> Result<Option<(Outcome, char)>> {
     let start = Instant::now();
     let (normalized, unknown) = sequence::normalize(sequence);
     rank::vocabulary(&normalized, &mut ws.seen, &mut ws.forward);
     timings.extraction += start.elapsed();
     timings.unknown_bases += unknown;
     if ws.forward.len() < SAMPLE_SIZE {
-        return Ok((Prediction::unclassified(), timings));
+        return Ok(None);
     }
     let key = rng::query_key(config.seed, &normalized);
-    let mut best: Option<(u8, Vec<u32>, char)> = None;
+    let mut best: Option<(Outcome, char)> = None;
     for strand in 0..if config.strand == Strand::Both { 2 } else { 1 } {
         let start = Instant::now();
         if strand == 1 {
@@ -469,7 +685,9 @@ pub fn classify(
         timings.sampling += start.elapsed();
 
         let start = Instant::now();
-        let outcome = score_strand(index, &words, &samples, &key, strand, config, weights, ws);
+        let outcome = score_strand(
+            index, &words, &samples, &key, strand, config, weights, hide, ws,
+        );
         timings.scoring += start.elapsed();
         if strand == 0 {
             ws.forward = words;
@@ -479,19 +697,192 @@ pub fn classify(
         let outcome = outcome?;
         timings.escalated |= outcome.escalated;
 
-        if best.as_ref().is_none_or(|(score, hits, _)| {
-            (outcome.max, outcome.winners.len()) > (*score, hits.len())
+        if best.as_ref().is_none_or(|(incumbent, _)| {
+            (outcome.max, outcome.winners.len()) > (incumbent.max, incumbent.winners.len())
         }) {
-            best = Some((
-                outcome.max,
-                outcome.winners,
-                if strand == 0 { '+' } else { '-' },
-            ));
+            best = Some((outcome, if strand == 0 { '+' } else { '-' }));
         }
     }
-    let (_, winners, strand) = best.unwrap();
+    Ok(best)
+}
+
+pub fn classify(
+    index: &Index,
+    sequence: &[u8],
+    config: &Config,
+    weights: &weight::Table,
+    params: Option<&protax::Params>,
+    hide: Option<Hide>,
+    ws: &mut Workspace,
+) -> Result<(Prediction, Timings)> {
+    config.validate()?;
+    ensure!(
+        weights.source() == config.weights,
+        "weight table does not match the configured source"
+    );
+    ensure!(
+        config.scorer == Scorer::Sintax || params.is_some(),
+        "--scorer protax requires --protax-params"
+    );
+    let mut timings = Timings::default();
+    let Some((outcome, strand)) =
+        best_strand(index, sequence, config, weights, hide, ws, &mut timings)?
+    else {
+        return Ok((Prediction::unclassified(), timings));
+    };
     let start = Instant::now();
-    let prediction = consensus(index, &winners, strand);
+    let prediction = match config.scorer {
+        Scorer::Sintax => consensus(index, &outcome.winners, strand),
+        Scorer::Protax => protax_consensus(
+            index,
+            &outcome,
+            strand,
+            config,
+            params.expect("checked"),
+            ws,
+        ),
+    };
     timings.taxonomy += start.elapsed();
     Ok((prediction, timings))
+}
+
+/// Turn one strand's evidence into a lineage under [`Scorer::Protax`].
+///
+/// Uses the same unclassified guard as [`consensus`], so both scorers agree on queries
+/// with no usable hit.
+fn protax_consensus(
+    index: &Index,
+    outcome: &Outcome,
+    strand: char,
+    config: &Config,
+    params: &protax::Params,
+    ws: &mut Workspace,
+) -> Prediction {
+    if outcome.winners.len() < BOOTSTRAPS / 2 {
+        return Prediction::unclassified();
+    }
+    let steps = protax::resolve(
+        index,
+        params,
+        &outcome.hits,
+        &outcome.winners,
+        config.floor,
+        &mut ws.protax,
+    );
+    if steps.is_empty() {
+        return Prediction::unclassified();
+    }
+    let mut prediction = Prediction {
+        strand: Some(strand),
+        ranks: Vec::with_capacity(steps.len()),
+        informative: [0; 7],
+        voted: steps.last().map_or(0, |s| s.rank + 1),
+        abstention_pluralities: 0,
+        probabilities: Vec::with_capacity(steps.len()),
+        novel: Vec::with_capacity(steps.len()),
+    };
+    for step in steps {
+        prediction.ranks.push(RankCall {
+            rank: step.rank,
+            name: index.name(step.node).to_owned(),
+            // Not the confidence here, but `--profile` and callers still read it.
+            votes: u8::try_from(
+                outcome
+                    .winners
+                    .iter()
+                    .filter(|&&w| index.lineage(w as usize)[step.rank as usize] == step.node)
+                    .count(),
+            )
+            .unwrap_or(u8::MAX),
+        });
+        prediction.probabilities.push(step.probability);
+        prediction.novel.push(step.novel);
+    }
+    prediction
+}
+
+/// Column names of the design-matrix dump, in output order.
+pub const FEATURE_HEADER: &str =
+    "query\trank\tkind\tnode\ts1\tgap\tvote\tgenera\tsentinel\tmultiplicity\ttruth\n";
+
+/// Emit the design matrix along the query's own lineage instead of a call.
+///
+/// Rows follow the query's annotation, not the model's choice, so they are trainable.
+/// `kind=present` rows are named children with a scored reference; `kind=absent` pools
+/// the rest with a `multiplicity`. The all-zero unknown branch is never written;
+/// a group without `truth=1` means the unknown branch is the true outcome.
+#[allow(clippy::too_many_arguments)]
+pub fn training_rows(
+    index: &Index,
+    sequence: &[u8],
+    label: &str,
+    config: &Config,
+    weights: &weight::Table,
+    locator: &Locator,
+    ws: &mut Workspace,
+) -> Result<(String, Timings)> {
+    config.validate()?;
+    let mut timings = Timings::default();
+    let lineage = taxonomy::parse(label)
+        .with_context(|| format!("--emit-features needs a tax= annotation on query {label:?}"))?;
+    let truth = locator.locate(&lineage);
+    let hide = hide_for(config, locator, label)?;
+    let Some((outcome, _)) = best_strand(index, sequence, config, weights, hide, ws, &mut timings)?
+    else {
+        return Ok((String::new(), timings));
+    };
+    if outcome.winners.len() < BOOTSTRAPS / 2 {
+        return Ok((String::new(), timings));
+    }
+
+    let start = Instant::now();
+    let mut out = String::new();
+    ws.protax.prepare(index, &outcome.hits, &outcome.winners);
+    let mut parent = 0u32;
+    for rank in 0..protax::LEVELS {
+        // Taxon not in this database: stop here.
+        let Some(node) = truth[rank] else { break };
+        // Blank rank in the query: descend through the sentinel without emitting rows,
+        // since real databases skip ranks.
+        if lineage[rank].is_none() {
+            parent = node;
+            continue;
+        }
+        let Some(design) =
+            ws.protax
+                .design(index, &outcome.hits, outcome.winners.len(), rank, parent)
+        else {
+            break;
+        };
+        let code = RANKS[rank] as char;
+        let target = truth[rank];
+        let mut resolved = false;
+        for row in &design.rows {
+            let hit = target == Some(row.node);
+            resolved |= hit;
+            out.push_str(&format!(
+                "{label}\t{code}\tpresent\t{}\t{:.6}\t{:.6}\t{:.4}\t{:.6}\t{:.6}\t1\t{}\n",
+                row.node,
+                row.s1,
+                row.gap,
+                row.vote,
+                row.genera,
+                design.sentinel,
+                u8::from(hit),
+            ));
+        }
+        if design.absent > 0 {
+            // True child present in the database but unseen by this query (PROTAX's `nseq0`).
+            let hit = target.is_some() && !resolved;
+            out.push_str(&format!(
+                "{label}\t{code}\tabsent\t0\t0\t0\t0\t0\t{:.6}\t{}\t{}\n",
+                design.sentinel,
+                design.absent,
+                u8::from(hit),
+            ));
+        }
+        parent = node;
+    }
+    timings.taxonomy += start.elapsed();
+    Ok((out, timings))
 }

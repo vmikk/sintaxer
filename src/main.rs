@@ -4,8 +4,8 @@ use sintaxer::{
     classify::Workspace,
     classify::{self, Config, Strand, Timings},
     curate,
-    index::{self, Index},
-    input, taxonomy, weight,
+    index::{self, Index, Locator},
+    input, protax, taxonomy, weight,
 };
 use std::{
     io::{self, BufWriter, Write},
@@ -76,6 +76,26 @@ enum Command {
         /// Append a fifth column with the replicates carrying a name at each rank.
         #[arg(long)]
         emit_informative: bool,
+        /// Decision rule turning scored references into a lineage: `sintax` is the
+        /// published plurality vote; `protax` is a per-rank multinomial logistic with a
+        /// novel-taxon outcome (needs coefficients fitted for this database).
+        #[arg(long, value_enum, default_value_t = classify::Scorer::Sintax)]
+        scorer: classify::Scorer,
+        /// Coefficients for `--scorer protax`, fitted against this database. Required by that scorer.
+        #[arg(long)]
+        protax_params: Option<PathBuf>,
+        /// Smallest cumulative probability to descend below with `--scorer protax`
+        /// (PROTAX's `prob_th`); bounds work, not calls.
+        #[arg(long, default_value_t = 0.001)]
+        floor: f64,
+        /// Hide part of the database from each query using its own `tax=` annotation:
+        /// `self` hides the query's record and duplicates, a rank code (e.g. `g`, `f`)
+        /// hides that whole clade. For training and validation only.
+        #[arg(long, value_enum)]
+        holdout: Option<classify::Holdout>,
+        /// Write PROTAX design-matrix rows instead of calls. Requires `--holdout`.
+        #[arg(long)]
+        emit_features: bool,
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
@@ -167,10 +187,13 @@ struct BatchResult {
     timings: Timings,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process(
     index: &Index,
     config: &Config,
     weights: &weight::Table,
+    params: Option<&protax::Params>,
+    locator: Option<&Locator>,
     batch: Vec<Record>,
     workspace: &mut Workspace,
 ) -> Result<BatchResult> {
@@ -183,13 +206,43 @@ fn process(
         timings: Timings::default(),
     };
     for record in batch {
-        let (prediction, times) =
-            classify::classify(index, &record.sequence, config, weights, workspace)
-                .with_context(|| format!("query {:?}", record.label))?;
-        result.contested += usize::from(prediction.abstention_pluralities > 0);
-        result
-            .output
-            .push_str(&prediction.tsv(&record.label, config));
+        let context = || format!("query {:?}", record.label);
+        let times = if config.emit_features {
+            let (rows, times) = classify::training_rows(
+                index,
+                &record.sequence,
+                &record.label,
+                config,
+                weights,
+                locator.expect("--emit-features builds a locator"),
+                workspace,
+            )
+            .with_context(context)?;
+            result.output.push_str(&rows);
+            times
+        } else {
+            let hide = match locator {
+                Some(locator) => {
+                    classify::hide_for(config, locator, &record.label).with_context(context)?
+                }
+                None => None,
+            };
+            let (prediction, times) = classify::classify(
+                index,
+                &record.sequence,
+                config,
+                weights,
+                params,
+                hide,
+                workspace,
+            )
+            .with_context(context)?;
+            result.contested += usize::from(prediction.abstention_pluralities > 0);
+            result
+                .output
+                .push_str(&prediction.tsv(&record.label, config));
+            times
+        };
         result.reads += 1;
         result.bases += record.sequence.len();
         result.escalated += usize::from(times.escalated);
@@ -207,13 +260,32 @@ fn run_classify(
     output: &Path,
     threads: usize,
     config: Config,
+    protax_params: Option<PathBuf>,
     profile: bool,
 ) -> Result<()> {
     ensure!((1..=1024).contains(&threads), "threads must be in 1..=1024");
     config.validate()?;
+    ensure!(
+        protax_params.is_none() || config.scorer == classify::Scorer::Protax,
+        "--protax-params only applies to --scorer protax"
+    );
     let wall = Instant::now();
     let index = Index::open(db)?;
     let weights = weight::Table::build(&index, config.weights, config.weight_share)?;
+    // Mapping a query's own annotation to index nodes needs a downward map, built
+    // only when a training flag asks for it.
+    let locator =
+        (config.holdout.is_some() || config.emit_features).then(|| Locator::build(&index));
+    let params = match &protax_params {
+        Some(path) => Some(protax::Params::load(path)?),
+        None => {
+            ensure!(
+                config.scorer == classify::Scorer::Sintax || config.emit_features,
+                "--scorer protax requires --protax-params; fit one with taxxi/fit_protax.py"
+            );
+            None
+        }
+    };
     let open_time = wall.elapsed();
     let mut reader = input::reader(reads)?;
     // File outputs are written atomically; a failure leaves any old output intact.
@@ -239,6 +311,9 @@ fn run_classify(
         None => Box::new(io::stdout()),
     };
     let mut writer = BufWriter::with_capacity(256 * 1024, sink);
+    if config.emit_features {
+        writer.write_all(classify::FEATURE_HEADER.as_bytes())?;
+    }
     let (mut total_reads, mut total_bases, mut escalated) = (0usize, 0usize, 0usize);
     let mut contested = 0usize;
     let mut totals = Timings::default();
@@ -254,6 +329,8 @@ fn run_classify(
             let index = &index;
             let config = &config;
             let weights = &weights;
+            let params = params.as_ref();
+            let locator = locator.as_ref();
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("sintaxer-{worker}"))
@@ -261,7 +338,15 @@ fn run_classify(
                         let mut workspace = Workspace::default();
                         while let Ok(batch) = rx.recv() {
                             if result_tx
-                                .send(process(index, config, weights, batch, &mut workspace))
+                                .send(process(
+                                    index,
+                                    config,
+                                    weights,
+                                    params,
+                                    locator,
+                                    batch,
+                                    &mut workspace,
+                                ))
                                 .is_err()
                             {
                                 break;
@@ -650,6 +735,11 @@ fn main() -> Result<()> {
             support,
             min_informative,
             emit_informative,
+            scorer,
+            protax_params,
+            floor,
+            holdout,
+            emit_features,
             profile,
         } => {
             run_classify(
@@ -669,7 +759,12 @@ fn main() -> Result<()> {
                     support,
                     min_informative,
                     emit_informative,
+                    scorer,
+                    floor,
+                    holdout,
+                    emit_features,
                 },
+                protax_params,
                 profile,
             )?;
         }

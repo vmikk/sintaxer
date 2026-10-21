@@ -1,3 +1,12 @@
+## [0.10.0]
+
+### Added
+- `--scorer protax`: a PROTAX-style calibrated probability per rank that includes an explicit novel-taxon outcome. It needs database-specific coefficients passed with `--protax-params`, and `--floor` bounds how deep it descends. It adds a fifth output column with the per-rank novelty probability. `sintax` stays the default.
+- `--holdout self|d|k|p|c|o|f|g` hides the query's own record or clade from the search, for leave-one-out validation against a production index.
+- `--emit-features` writes design-matrix rows for fitting protax coefficients instead of calls.
+
+### Changed
+- Index format bumped to 4 (reference vocabulary and per-node statistics); rebuild existing indexes.
 
 ## [0.9.0]
 

@@ -1,5 +1,5 @@
 //! Immutable, memory-mapped STX2 index.
-use crate::{ALGORITHM_VERSION, K, WORDS, input, sequence, taxonomy::TreeBuilder};
+use crate::{ALGORITHM_VERSION, K, TILE, WORDS, input, sequence, taxonomy::TreeBuilder};
 use anyhow::{Context, Result, ensure};
 use memmap2::{Mmap, MmapMut};
 use std::{
@@ -16,7 +16,7 @@ const NODE: usize = 24;
 /// Per-node aggregates: references, named children, genus-rank descendants (three u32).
 const NODE_STAT: usize = 12;
 const MAGIC: &[u8; 8] = b"SINTAXER";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 // Header slots for the packed sequence sections.
 const H_SEQ_DIR: usize = 160;
@@ -25,11 +25,53 @@ const H_SEQ_LEN: usize = 176;
 // Header slots for the vocabulary and node-statistics sections.
 const H_VOCAB: usize = 184;
 const H_NODE_STATS: usize = 192;
+/// Every k-mer of a packed record, in sequence order, duplicates included.
+///
+/// Shared by [`Index::visit_kmers`] and [`Index::reference_words`]; an ambiguous
+/// base breaks the window. Works run by run of unambiguous bases, one packed byte at a time.
+fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnMut(u16)) {
+    let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
+    let mut next_break = breaks.next().unwrap_or(usize::MAX);
+    let mut at = 0;
+    while at < bases {
+        // This run of unambiguous bases is `at .. end`; the window starts empty.
+        let end = next_break.min(bases);
+        let mut word = 0u16;
+        // The first `K - 1` bases of a run only fill the window.
+        let prologue = end.min(at + K - 1);
+        while at < prologue {
+            word = (word << 2) | u16::from((packed[at / 4] >> ((at % 4) * 2)) & 3);
+            at += 1;
+        }
+        // From here every base completes a word.
+        while at < end {
+            let byte = packed[at / 4];
+            let stop = end.min(at + 4 - at % 4);
+            let mut shift = (at % 4) * 2;
+            while at < stop {
+                word = (word << 2) | u16::from((byte >> shift) & 3);
+                visit(word);
+                at += 1;
+                shift += 2;
+            }
+        }
+        // Step over the ambiguous base and start a fresh window.
+        at = end + 1;
+        next_break = breaks.next().unwrap_or(usize::MAX);
+    }
+}
+
+fn u16_at(b: &[u8], p: usize) -> u16 {
+    u16::from_le_bytes(b[p..p + 2].try_into().unwrap())
+}
 fn u32_at(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
 }
 fn u64_at(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
+}
+fn put16(b: &mut [u8], p: usize, v: u16) {
+    b[p..p + 2].copy_from_slice(&v.to_le_bytes());
 }
 fn put32(b: &mut [u8], p: usize, v: u32) {
     b[p..p + 4].copy_from_slice(&v.to_le_bytes());
@@ -64,7 +106,6 @@ fn sweep_taxa(
         let p = HEADER + word * ENTRY;
         let offset = u64_at(map, p) as usize;
         let length = u64_at(map, p + 8) as usize;
-        let dense = map[p + 20] == 1;
         let stamp = word as u32;
         let mut count = |reference: usize| {
             let g = leaf(reference);
@@ -78,22 +119,39 @@ fn sweep_taxa(
                 }
             }
         };
-        if dense {
-            for (i, byte) in map[offset..offset + length].iter().enumerate() {
-                let mut bits = *byte;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let reference = i * 8 + bit;
-                    if reference < references {
-                        count(reference);
+        match Layout::from_code(map[p + 20]) {
+            Some(Layout::Bitmap) => {
+                for (i, byte) in map[offset..offset + length].iter().enumerate() {
+                    let mut bits = *byte;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let reference = i * 8 + bit;
+                        if reference < references {
+                            count(reference);
+                        }
                     }
                 }
             }
-        } else {
-            for chunk in map[offset..offset + length].chunks_exact(4) {
-                count(u32::from_le_bytes(chunk.try_into().unwrap()) as usize);
+            Some(Layout::Postings) => {
+                for chunk in map[offset..offset + length].chunks_exact(4) {
+                    count(u32::from_le_bytes(chunk.try_into().unwrap()) as usize);
+                }
             }
+            Some(Layout::Blocked) => {
+                let row = &map[offset..offset + length];
+                let (mut at, mut base) = (0usize, 0usize);
+                while at + 2 <= row.len() {
+                    let block = u16_at(row, at) as usize;
+                    at += 2;
+                    for local in row[at..at + block * 2].chunks_exact(2) {
+                        count(base + u16::from_le_bytes(local.try_into().unwrap()) as usize);
+                    }
+                    at += block * 2;
+                    base += TILE;
+                }
+            }
+            None => {}
         }
     }
     (genera, families)
@@ -150,21 +208,63 @@ pub struct Index {
     validated: Vec<AtomicBool>,
 }
 
+/// How a word's posting row is stored; the builder picks the smallest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout {
+    /// Strictly increasing `u32` reference ids. Smallest for rare words.
+    Postings,
+    /// One bit per reference, `ceil(N/8)` bytes. Smallest for common words.
+    Bitmap,
+    /// Per tile, a `u16` count followed by that tile's ids as `u16` offsets
+    /// from the tile start. Smallest in between.
+    Blocked,
+}
+
+impl Layout {
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Postings),
+            1 => Some(Self::Bitmap),
+            2 => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+    /// Bytes a row of `count` postings occupies over `references` references.
+    fn len(self, references: usize, count: usize) -> u64 {
+        match self {
+            Self::Postings => count as u64 * 4,
+            Self::Bitmap => (references as u64).div_ceil(8),
+            Self::Blocked => (references.div_ceil(TILE) as u64 + count as u64) * 2,
+        }
+    }
+    /// The smallest layout for a row.
+    fn best(references: usize, count: usize) -> Self {
+        // Keep the bitmap test independent of the blocked layout so the dense/sparse
+        // split doesn't shift. Blocked wins over postings above one posting per tile.
+        if Self::Bitmap.len(references, count) < Self::Postings.len(references, count) {
+            Self::Bitmap
+        } else if references.div_ceil(TILE) < count {
+            Self::Blocked
+        } else {
+            Self::Postings
+        }
+    }
+    fn code(self) -> u8 {
+        match self {
+            Self::Postings => 0,
+            Self::Bitmap => 1,
+            Self::Blocked => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Row<'a> {
     data: &'a [u8],
-    pub dense: bool,
+    pub layout: Layout,
     pub count: usize,
 }
 impl Row<'_> {
-    /// A scratch bitmap produced by the exact projection engine.
-    pub fn bitmap(data: &[u8]) -> Row<'_> {
-        Row {
-            data,
-            dense: true,
-            count: 0,
-        }
-    }
     fn id(&self, i: usize) -> usize {
         u32_at(self.data, i * 4) as usize
     }
@@ -180,95 +280,138 @@ impl Row<'_> {
         }
         lo
     }
+    /// Every reference id in `start .. end`, ascending.
+    ///
+    /// Blocked rows have no tile directory, so a narrow range still walks from the start.
     pub fn visit(&self, start: usize, end: usize, mut f: impl FnMut(usize)) {
-        if self.dense {
-            let mut block = start / 64 * 64;
-            while block < end {
-                let mut bits = self.bits64(block);
-                if block < start {
-                    bits &= u64::MAX << (start - block);
+        match self.layout {
+            Layout::Bitmap => {
+                let mut block = start / 64 * 64;
+                while block < end {
+                    let mut bits = self.bits64(block);
+                    if block < start {
+                        bits &= u64::MAX << (start - block);
+                    }
+                    if end - block < 64 {
+                        bits &= (1u64 << (end - block)) - 1;
+                    }
+                    while bits != 0 {
+                        f(block + bits.trailing_zeros() as usize);
+                        bits &= bits - 1;
+                    }
+                    block += 64;
                 }
-                if end - block < 64 {
-                    bits &= (1u64 << (end - block)) - 1;
-                }
-                while bits != 0 {
-                    f(block + bits.trailing_zeros() as usize);
-                    bits &= bits - 1;
-                }
-                block += 64;
             }
-        } else {
-            let mut i = self.lower_bound(start);
-            while i < self.count {
-                let id = self.id(i);
-                if id >= end {
-                    break;
+            Layout::Postings => {
+                let mut i = self.lower_bound(start);
+                while i < self.count {
+                    let id = self.id(i);
+                    if id >= end {
+                        break;
+                    }
+                    f(id);
+                    i += 1;
                 }
-                f(id);
-                i += 1;
+            }
+            Layout::Blocked => {
+                let (mut at, mut base) = (0, 0);
+                while at + 2 <= self.data.len() && base < end {
+                    let block = u16_at(self.data, at) as usize;
+                    at += 2;
+                    for local in self.data[at..at + block * 2].chunks_exact(2) {
+                        let id = base + u16::from_le_bytes(local.try_into().unwrap()) as usize;
+                        if id >= start && id < end {
+                            f(id);
+                        }
+                    }
+                    at += block * 2;
+                    base += TILE;
+                }
             }
         }
     }
-    /// Membership bits for a whole tile of references, written into `out`.
+    /// Add one to `counts[id - start]` for every posting of this sparse row inside
+    /// the tile `start .. start + counts.len()`.
     ///
-    /// `cursor` must start at zero and is carried across calls with ascending
-    /// `start`, making sparse rows O(1) amortised per tile instead of a binary search.
-    pub fn tile_bits(&self, start: usize, out: &mut [u64], cursor: &mut usize) {
-        out.fill(0);
-        let end = start + out.len() * 64;
-        if self.dense {
-            for (lane, slot) in out.iter_mut().enumerate() {
-                *slot = self.bits64(start + lane * 64);
-            }
-            return;
+    /// `cursor` counts consumed postings and carries across calls with ascending `start`.
+    pub fn tile_increment(&self, start: usize, counts: &mut [u16], cursor: &mut usize) {
+        debug_assert_eq!(self.layout, Layout::Postings);
+        let end = start + counts.len();
+        let mut i = *cursor;
+        // A stale cursor can only point before the tile: postings are strictly
+        // increasing and tiles are visited in order.
+        while i < self.count && self.id(i) < start {
+            i += 1;
         }
-        // Postings are strictly increasing, so a stale cursor can only point before
-        // the tile: skip forward, then emit until past its end.
-        while *cursor < self.count && self.id(*cursor) < start {
-            *cursor += 1;
-        }
-        while *cursor < self.count {
-            let id = self.id(*cursor);
+        // Slice once so the loop avoids a bounds check per posting.
+        for posting in self.data[i * 4..self.count * 4].chunks_exact(4) {
+            let id = u32::from_le_bytes(posting.try_into().unwrap()) as usize;
             if id >= end {
                 break;
             }
-            out[(id - start) / 64] |= 1 << ((id - start) % 64);
-            *cursor += 1;
+            counts[id - start] += 1;
+            i += 1;
+        }
+        *cursor = i;
+    }
+
+    /// Add one to `counts[local]` for every posting of this blocked row in the next
+    /// tile, and advance `cursor` (a byte offset, starting at zero) past its block.
+    /// Every tile has a block, even empty ones, so no seeking is needed.
+    pub fn blocked_tile(&self, counts: &mut [u16], cursor: &mut usize) {
+        debug_assert_eq!(self.layout, Layout::Blocked);
+        let block = u16_at(self.data, *cursor) as usize;
+        let at = *cursor + 2;
+        for local in self.data[at..at + block * 2].chunks_exact(2) {
+            counts[u16::from_le_bytes(local.try_into().unwrap()) as usize] += 1;
+        }
+        *cursor = at + block * 2;
+    }
+
+    /// Membership bits for a whole tile of a dense row, in one bulk read.
+    ///
+    /// `start` is tile-aligned, so the tile is one contiguous run of bytes; only
+    /// the final tile can be short.
+    pub fn dense_tile(&self, start: usize, out: &mut [u64]) {
+        debug_assert_eq!(self.layout, Layout::Bitmap);
+        let off = start / 8;
+        if let Some(src) = self.data.get(off..off + out.len() * 8) {
+            for (slot, word) in out.iter_mut().zip(src.chunks_exact(8)) {
+                *slot = u64::from_le_bytes(word.try_into().unwrap());
+            }
+            return;
+        }
+        let src = self.data.get(off..).unwrap_or_default();
+        let mut whole = src.chunks_exact(8);
+        for (slot, word) in out.iter_mut().zip(&mut whole) {
+            *slot = u64::from_le_bytes(word.try_into().unwrap());
+        }
+        for slot in &mut out[src.len() / 8..] {
+            *slot = 0;
+        }
+        let tail = whole.remainder();
+        if !tail.is_empty()
+            && let Some(slot) = out.get_mut(src.len() / 8)
+        {
+            let mut bytes = [0u8; 8];
+            bytes[..tail.len()].copy_from_slice(tail);
+            *slot = u64::from_le_bytes(bytes);
         }
     }
 
-    /// Membership bits for 64 references; `start` must be a multiple of 64.
-    pub fn bits64(&self, start: usize) -> u64 {
+    /// Membership bits for 64 references of a bitmap row; `start` must be a
+    /// multiple of 64. Used by [`Row::visit`].
+    fn bits64(&self, start: usize) -> u64 {
         debug_assert_eq!(start % 64, 0);
-        if self.dense {
-            let off = start / 8;
-            if off >= self.data.len() {
-                return 0;
-            }
-            let mut bytes = [0; 8];
-            let n = (self.data.len() - off).min(8);
-            bytes[..n].copy_from_slice(&self.data[off..off + n]);
-            u64::from_le_bytes(bytes)
-        } else {
-            let mut bits = 0;
-            let mut i = self.lower_bound(start);
-            while i < self.count {
-                let id = self.id(i);
-                if id >= start + 64 {
-                    break;
-                }
-                bits |= 1 << (id - start);
-                i += 1;
-            }
-            bits
+        debug_assert_eq!(self.layout, Layout::Bitmap);
+        let off = start / 8;
+        if off >= self.data.len() {
+            return 0;
         }
-    }
-    pub fn dense256(&self, start: usize) -> Option<&[u8]> {
-        if self.dense {
-            self.data.get(start / 8..start / 8 + 32)
-        } else {
-            None
-        }
+        let mut bytes = [0; 8];
+        let n = (self.data.len() - off).min(8);
+        bytes[..n].copy_from_slice(&self.data[off..off + n]);
+        u64::from_le_bytes(bytes)
     }
 }
 
@@ -380,15 +523,14 @@ impl Index {
                 u32_at(&map, p + 16) as u64,
                 map[p + 20],
             );
+            let layout = Layout::from_code(kind);
             ensure!(
-                count <= references as u64 && kind <= 1,
+                count <= references as u64 && layout.is_some(),
                 "invalid directory entry {w}"
             );
-            let expected = if kind == 1 {
-                (references as u64).div_ceil(8)
-            } else {
-                count * 4
-            };
+            let expected = layout
+                .expect("checked above")
+                .len(references, count as usize);
             ensure!(off == next && len == expected, "invalid row layout {w}");
             next = off.checked_add(len).context("row offset overflow")?;
             ensure!(next <= map.len() as u64, "row {w} extends beyond file");
@@ -454,32 +596,68 @@ impl Index {
         let len = u64_at(&self.map, p + 8) as usize;
         let row = Row {
             data: &self.map[off..off + len],
-            dense: self.map[p + 20] == 1,
+            // `open` has already rejected unknown layout codes.
+            layout: Layout::from_code(self.map[p + 20]).unwrap_or(Layout::Postings),
             count: u32_at(&self.map, p + 16) as usize,
         };
         // Validate the payload once, lazily, before kernels use its IDs.
         if !self.validated[word as usize].load(Ordering::Acquire) {
-            if row.dense {
-                let ones: usize = row.data.iter().map(|b| b.count_ones() as usize).sum();
-                ensure!(
-                    ones == row.count,
-                    "bitmap cardinality mismatch for word {word}"
-                );
-                if !self.references.is_multiple_of(8) {
+            match row.layout {
+                Layout::Bitmap => {
+                    let ones: usize = row.data.iter().map(|b| b.count_ones() as usize).sum();
                     ensure!(
-                        row.data.last().unwrap() >> (self.references % 8) == 0,
-                        "nonzero bitmap tail"
+                        ones == row.count,
+                        "bitmap cardinality mismatch for word {word}"
                     );
+                    if !self.references.is_multiple_of(8) {
+                        ensure!(
+                            row.data.last().unwrap() >> (self.references % 8) == 0,
+                            "nonzero bitmap tail"
+                        );
+                    }
                 }
-            } else {
-                let mut prev = None;
-                for i in 0..row.count {
-                    let id = row.id(i);
+                Layout::Postings => {
+                    let mut prev = None;
+                    for i in 0..row.count {
+                        let id = row.id(i);
+                        ensure!(
+                            id < self.references && prev.is_none_or(|v| id > v),
+                            "invalid posting for word {word}"
+                        );
+                        prev = Some(id);
+                    }
+                }
+                // The blocked kernel indexes the count window with stored offsets unchecked,
+                // so every offset must lie inside its tile (including the short final tile).
+                Layout::Blocked => {
+                    let tiles = self.references.div_ceil(TILE);
+                    let (mut at, mut total) = (0usize, 0usize);
+                    for tile in 0..tiles {
+                        ensure!(at + 2 <= row.data.len(), "truncated block for word {word}");
+                        let block = u16_at(row.data, at) as usize;
+                        at += 2;
+                        ensure!(
+                            at + block * 2 <= row.data.len(),
+                            "truncated block for word {word}"
+                        );
+                        let mut prev = None;
+                        for local in row.data[at..at + block * 2].chunks_exact(2) {
+                            let local = u16::from_le_bytes(local.try_into().unwrap()) as usize;
+                            ensure!(
+                                local < TILE
+                                    && tile * TILE + local < self.references
+                                    && prev.is_none_or(|v| local > v),
+                                "invalid posting for word {word}"
+                            );
+                            prev = Some(local);
+                        }
+                        at += block * 2;
+                        total += block;
+                    }
                     ensure!(
-                        id < self.references && prev.is_none_or(|v| id > v),
-                        "invalid posting for word {word}"
+                        at == row.data.len() && total == row.count,
+                        "block cardinality mismatch for word {word}"
                     );
-                    prev = Some(id);
                 }
             }
             self.validated[word as usize].store(true, Ordering::Release);
@@ -518,25 +696,9 @@ impl Index {
     /// Every k-mer of one reference, in sequence order, duplicates included.
     ///
     /// Not deduplicated: callers only set membership bits, which is idempotent.
-    pub fn visit_kmers(&self, reference: usize, mut visit: impl FnMut(u16)) -> Result<()> {
+    pub fn visit_kmers(&self, reference: usize, visit: impl FnMut(u16)) -> Result<()> {
         let (bases, ambiguous, packed) = self.record(reference)?;
-        let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
-        let mut next_break = breaks.next().unwrap_or(usize::MAX);
-        let (mut word, mut run) = (0u16, 0usize);
-        for position in 0..bases as usize {
-            if position == next_break {
-                word = 0;
-                run = 0;
-                next_break = breaks.next().unwrap_or(usize::MAX);
-                continue;
-            }
-            let code = (packed[position / 4] >> ((position % 4) * 2)) & 3;
-            word = (word << 2) | u16::from(code);
-            run = (run + 1).min(K);
-            if run == K {
-                visit(word);
-            }
-        }
+        walk_kmers(bases as usize, ambiguous, packed, visit);
         Ok(())
     }
 
@@ -552,26 +714,9 @@ impl Index {
     ) -> Result<()> {
         let (bases, ambiguous, packed) = self.record(reference)?;
         seen.fill(0);
-        let mut next_break = usize::MAX;
-        let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
-        if let Some(first) = breaks.next() {
-            next_break = first;
-        }
-        let (mut word, mut run) = (0u16, 0usize);
-        for position in 0..bases as usize {
-            if position == next_break {
-                word = 0;
-                run = 0;
-                next_break = breaks.next().unwrap_or(usize::MAX);
-                continue;
-            }
-            let code = (packed[position / 4] >> ((position % 4) * 2)) & 3;
-            word = (word << 2) | u16::from(code);
-            run = (run + 1).min(K);
-            if run == K {
-                seen[word as usize / 64] |= 1 << (word % 64);
-            }
-        }
+        walk_kmers(bases as usize, ambiguous, packed, |word| {
+            seen[word as usize / 64] |= 1 << (word % 64);
+        });
         for (i, bits) in seen.iter().enumerate() {
             let mut bits = *bits;
             while bits != 0 {
@@ -702,10 +847,13 @@ impl Index {
     pub fn family_frequency(&self, word: u16) -> u32 {
         u32_at(&self.map, HEADER + word as usize * ENTRY + 28)
     }
-    pub fn dense_rows(&self) -> usize {
+    pub fn rows_with(&self, layout: Layout) -> usize {
         (0..WORDS)
-            .filter(|w| self.map[HEADER + w * ENTRY + 20] == 1)
+            .filter(|w| self.map[HEADER + w * ENTRY + 20] == layout.code())
             .count()
+    }
+    pub fn dense_rows(&self) -> usize {
+        self.rows_with(Layout::Bitmap)
     }
     pub fn leaf(&self, reference: usize) -> u32 {
         u32_at(&self.map, self.refs_offset + reference * 4)
@@ -921,17 +1069,13 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     let node_stats_offset = align64(vocab_offset + n as u64 * 2);
     let payload = align64(node_stats_offset + tree.nodes.len() as u64 * NODE_STAT as u64);
     let mut offsets = vec![0u64; WORDS];
-    let mut dense = vec![false; WORDS];
+    let mut layouts = vec![Layout::Postings; WORDS];
     let mut total = payload;
     for w in 0..WORDS {
         offsets[w] = total;
-        dense[w] = (n as u64).div_ceil(8) < counts[w] as u64 * 4;
+        layouts[w] = Layout::best(n, counts[w] as usize);
         total = total
-            .checked_add(if dense[w] {
-                (n as u64).div_ceil(8)
-            } else {
-                counts[w] as u64 * 4
-            })
+            .checked_add(layouts[w].len(n, counts[w] as usize))
             .context("index too large")?;
     }
     let mut out = tempfile::NamedTempFile::new_in(parent)?;
@@ -965,17 +1109,9 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     for w in 0..WORDS {
         let p = HEADER + w * ENTRY;
         put64(&mut map, p, offsets[w]);
-        put64(
-            &mut map,
-            p + 8,
-            if dense[w] {
-                (n as u64).div_ceil(8)
-            } else {
-                counts[w] as u64 * 4
-            },
-        );
+        put64(&mut map, p + 8, layouts[w].len(n, counts[w] as usize));
         put32(&mut map, p + 16, counts[w]);
-        map[p + 20] = u8::from(dense[w]);
+        map[p + 20] = layouts[w].code();
     }
     for (i, &leaf) in leaves.iter().enumerate() {
         put32(&mut map, refs_offset as usize + i * 4, leaf);
@@ -1019,7 +1155,12 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         drop(reader);
         std::fs::remove_file(path)?;
     }
+    // One streaming pass writes all layouts. The file is zero-filled, so empty tiles
+    // already have a zero count. `cursors`: next id offset; `blocks`: current tile's
+    // count offset; `tiles`: current tile index.
     let mut cursors = offsets.clone();
+    let mut blocks = vec![0u64; WORDS];
+    let mut tiles = vec![usize::MAX; WORDS];
     for bucket in 0..256 {
         let path = tempdir.path().join(bucket.to_string());
         let file = File::open(&path)?;
@@ -1030,11 +1171,27 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
             reader.read_exact(&mut pair)?;
             let w = u16::from_le_bytes(pair[..2].try_into().unwrap()) as usize;
             let id = u32::from_le_bytes(pair[2..].try_into().unwrap()) as usize;
-            if dense[w] {
-                map[offsets[w] as usize + id / 8] |= 1 << (id % 8);
-            } else {
-                put32(&mut map, cursors[w] as usize, id as u32);
-                cursors[w] += 4;
+            match layouts[w] {
+                Layout::Bitmap => map[offsets[w] as usize + id / 8] |= 1 << (id % 8),
+                Layout::Postings => {
+                    put32(&mut map, cursors[w] as usize, id as u32);
+                    cursors[w] += 4;
+                }
+                Layout::Blocked => {
+                    let tile = id / TILE;
+                    if tiles[w] != tile {
+                        // Skip the (already zero) count slots of the empty tiles in between.
+                        let skipped = tile.wrapping_sub(tiles[w].wrapping_add(1));
+                        blocks[w] = cursors[w] + skipped as u64 * 2;
+                        cursors[w] = blocks[w] + 2;
+                        tiles[w] = tile;
+                    }
+                    put16(&mut map, cursors[w] as usize, (id % TILE) as u16);
+                    cursors[w] += 2;
+                    let at = blocks[w] as usize;
+                    let filled = u16_at(&map, at) + 1;
+                    put16(&mut map, at, filled);
+                }
             }
         }
         drop(reader);

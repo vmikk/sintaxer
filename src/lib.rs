@@ -19,6 +19,10 @@ pub const ALGORITHM_VERSION: u32 = 1;
 /// so behaviour changes don't re-key draws with the new options off.
 pub const CLASSIFIER_VERSION: u32 = 4;
 pub const K: usize = 8;
+/// References per tile, shared by the rank sweep and the index layout.
+/// Posting rows are blocked on the same boundary so postings fit in a `u16`.
+/// Changing it changes the on-disk format.
+pub const TILE: usize = 4096;
 pub const WORDS: usize = 1 << (2 * K);
 pub const BOOTSTRAPS: usize = 100;
 pub const SAMPLE_SIZE: usize = 32;

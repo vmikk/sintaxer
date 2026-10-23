@@ -249,6 +249,7 @@ fn process(
         result.timings.extraction += times.extraction;
         result.timings.sampling += times.sampling;
         result.timings.scoring += times.scoring;
+        result.timings.rank += times.rank;
         result.timings.taxonomy += times.taxonomy;
     }
     Ok(result)
@@ -414,6 +415,7 @@ fn run_classify(
                     totals.extraction += result.timings.extraction;
                     totals.sampling += result.timings.sampling;
                     totals.scoring += result.timings.scoring;
+                    totals.rank += result.timings.rank;
                     totals.taxonomy += result.timings.taxonomy;
                 }
             }
@@ -442,7 +444,7 @@ fn run_classify(
     );
     if profile {
         eprintln!(
-            "index_open_s={:.6} first_result_s={:.6} parse_decompress_s={:.6} write_s={:.6} extraction_worker_s={:.6} sampling_worker_s={:.6} scoring_worker_s={:.6} taxonomy_worker_s={:.6}",
+            "index_open_s={:.6} first_result_s={:.6} parse_decompress_s={:.6} write_s={:.6} extraction_worker_s={:.6} sampling_worker_s={:.6} scoring_worker_s={:.6} rank_worker_s={:.6} taxonomy_worker_s={:.6}",
             open_time.as_secs_f64(),
             first_result.unwrap_or_default().as_secs_f64(),
             parsing.as_secs_f64(),
@@ -450,6 +452,7 @@ fn run_classify(
             totals.extraction.as_secs_f64(),
             totals.sampling.as_secs_f64(),
             totals.scoring.as_secs_f64(),
+            totals.rank.as_secs_f64(),
             totals.taxonomy.as_secs_f64()
         );
         // Report escalations: when candidate restriction fails, it silently escalates
@@ -707,13 +710,14 @@ fn main() -> Result<()> {
                 index.verify()?;
             }
             println!(
-                "format={}\nalgorithm={}\nk=8\nreferences={}\n{}\ntaxonomy_nodes={}\ndense_rows={}\nbytes={}\nsequence_bytes={}\nsource_blake3={}\nverified={verify}",
+                "format={}\nalgorithm={}\nk=8\nreferences={}\n{}\ntaxonomy_nodes={}\ndense_rows={}\nblocked_rows={}\nbytes={}\nsequence_bytes={}\nsource_blake3={}\nverified={verify}",
                 index.format_version(),
                 index.algorithm_version(),
                 index.references,
                 census_line(&index),
                 index.nodes,
                 index.dense_rows(),
+                index.rows_with(sintaxer::index::Layout::Blocked),
                 index.file_bytes(),
                 index.sequence_bytes(),
                 index.source_hash()

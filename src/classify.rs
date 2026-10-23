@@ -183,6 +183,8 @@ pub struct Timings {
     pub extraction: Duration,
     pub sampling: Duration,
     pub scoring: Duration,
+    /// Part of `scoring` spent in the whole-vocabulary rank sweep.
+    pub rank: Duration,
     pub taxonomy: Duration,
     /// Whether any strand needed a wider candidate set than the default.
     pub escalated: bool,
@@ -358,6 +360,8 @@ struct Outcome {
     /// outside it. Empty under [`Scorer::Sintax`]. Collected per strand, because the rank
     /// pass overwrites its counts on the next strand.
     hits: Vec<protax::Hit>,
+    /// Time spent in [`Workspace::rank`] for this strand.
+    rank: Duration,
 }
 
 /// The candidate set as PROTAX similarities, with outside replicate winners folded in.
@@ -557,6 +561,7 @@ fn score_strand(
     ws: &mut Workspace,
 ) -> Result<Outcome> {
     let mut escalated = false;
+    let mut ranking = Duration::ZERO;
     // With a candidate set that is a large share of the database, the rank pass and
     // projection cost more than scoring everything, so small databases go exact.
     // Hiding only works on the candidate path, so it always takes it.
@@ -566,7 +571,9 @@ fn score_strand(
     let mut tops = if !worth_it {
         exact_tops(index, words, samples, weights, ws)?
     } else {
+        let start = Instant::now();
         ws.rank.rank(index, words)?;
+        ranking += start.elapsed();
         if let Some(hide) = hide {
             let vocabulary = words.len();
             ws.rank
@@ -628,7 +635,9 @@ fn score_strand(
     // Re-selecting also keeps the feature window the same size after an escalation.
     let hits = if config.scorer == Scorer::Protax || config.emit_features {
         if !worth_it {
+            let start = Instant::now();
             ws.rank.rank(index, words)?;
+            ranking += start.elapsed();
         }
         ws.rank.select(config.candidates);
         protax_hits(index, ws, words.len(), &winners)
@@ -640,6 +649,7 @@ fn score_strand(
         winners,
         escalated,
         hits,
+        rank: ranking,
     })
 }
 
@@ -695,6 +705,7 @@ fn best_strand(
             ws.reverse = words;
         }
         let outcome = outcome?;
+        timings.rank += outcome.rank;
         timings.escalated |= outcome.escalated;
 
         if best.as_ref().is_none_or(|(incumbent, _)| {

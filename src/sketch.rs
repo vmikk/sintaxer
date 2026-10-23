@@ -41,12 +41,6 @@ impl<const S: usize> Sketch<S> {
     pub fn values(&self) -> &[u16] {
         &self.values[..self.len as usize]
     }
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
     /// Rebuild from [`Sketch::values`] output, for the survey cache. The tail is
     /// padded with `u16::MAX` like [`sketch`] does, and excess input is truncated.
     pub fn restore(values: &[u16]) -> Self {

@@ -1,4 +1,12 @@
-## [0.10.0]
+## [0.11.0]
+
+### Changed
+- Index format bumped to 5 (blocked posting rows); rebuild existing indexes. Indexes come out roughly a third smaller.
+- Release builds now target x86-64-v3, so an AVX2-capable CPU is required.
+- `inspect` reports the number of blocked rows, and `--profile` reports rank-sweep time separately.
+
+### Performance
+- Rewritten rank sweep: separate dense and sparse kernels, carry-save accumulation and a bit-matrix transpose. Throughput on million-reference databases is several times higher, peak memory is lower, and output is unchanged.
 
 ### Added
 - `--scorer protax`: a PROTAX-style calibrated probability per rank that includes an explicit novel-taxon outcome. It needs database-specific coefficients passed with `--protax-params`, and `--floor` bounds how deep it descends. It adds a fifth output column with the per-rank novelty probability. `sintax` stays the default.

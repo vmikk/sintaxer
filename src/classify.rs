@@ -14,9 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Which query strands are scored. `Plus` suits oriented amplicons.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Strand {
+    /// Score both strands and keep the better, for input of mixed orientation.
     Both,
+    /// Score the query as given, for reads already in forward orientation.
     Plus,
 }
 /// Which decision rule turns the scored references into a lineage.
@@ -111,7 +114,7 @@ impl Default for Config {
         Self {
             seed: 1,
             cutoff: 0.8,
-            strand: Strand::Both,
+            strand: Strand::Plus,
             exact: false,
             candidates: 2048,
             risk: 0.0,
@@ -188,6 +191,12 @@ pub struct Timings {
     pub taxonomy: Duration,
     /// Whether any strand needed a wider candidate set than the default.
     pub escalated: bool,
+    /// Whether `--strand both` skipped the reverse strand; see `unbeatable`.
+    pub reverse_skipped: bool,
+    /// Candidate-set size summed over strands that took the candidate path, and the
+    /// number of such strands.
+    pub candidates: usize,
+    pub candidate_strands: usize,
     /// Bytes that were neither ACGT nor a recognised ambiguity code.
     pub unknown_bases: usize,
 }
@@ -362,6 +371,8 @@ struct Outcome {
     hits: Vec<protax::Hit>,
     /// Time spent in [`Workspace::rank`] for this strand.
     rank: Duration,
+    /// Final candidate-set size, or `None` when the strand took the exact path.
+    candidates: Option<usize>,
 }
 
 /// The candidate set as PROTAX similarities, with outside replicate winners folded in.
@@ -616,6 +627,8 @@ fn score_strand(
         }
     };
     tops.truncate(BOOTSTRAPS);
+    // Read before the protax re-selection resizes the set.
+    let candidates = from_candidates.then_some(ws.rank.candidates.len());
 
     let mut max = 0;
     let mut winners = Vec::with_capacity(BOOTSTRAPS);
@@ -650,10 +663,21 @@ fn score_strand(
         escalated,
         hits,
         rank: ranking,
+        candidates,
     })
 }
 
-/// Score both strands and keep the better, with everything a scorer reads.
+/// Whether no other strand can displace this outcome.
+///
+/// The incumbent keeps ties, so a strand at the maximum possible score with every
+/// replicate voting cannot lose and the reverse strand can be skipped.
+fn unbeatable(outcome: &Outcome, weights: &weight::Table) -> bool {
+    usize::from(outcome.max) == SAMPLE_SIZE * usize::from(weights.max())
+        && outcome.winners.len() == BOOTSTRAPS
+}
+
+/// Score the configured strands and keep the better, with everything a scorer reads.
+/// Under `--strand both` the reverse is skipped when the forward is [`unbeatable`].
 ///
 /// Shared by classification and training-row emission so both see the same evidence.
 /// `Ok(None)` means the query has too few distinct words to sample from.
@@ -677,6 +701,14 @@ fn best_strand(
     let key = rng::query_key(config.seed, &normalized);
     let mut best: Option<(Outcome, char)> = None;
     for strand in 0..if config.strand == Strand::Both { 2 } else { 1 } {
+        if strand == 1
+            && best
+                .as_ref()
+                .is_some_and(|(forward, _)| unbeatable(forward, weights))
+        {
+            timings.reverse_skipped = true;
+            break;
+        }
         let start = Instant::now();
         if strand == 1 {
             let forward = std::mem::take(&mut ws.forward);
@@ -707,6 +739,10 @@ fn best_strand(
         let outcome = outcome?;
         timings.rank += outcome.rank;
         timings.escalated |= outcome.escalated;
+        if let Some(candidates) = outcome.candidates {
+            timings.candidates += candidates;
+            timings.candidate_strands += 1;
+        }
 
         if best.as_ref().is_none_or(|(incumbent, _)| {
             (outcome.max, outcome.winners.len()) > (incumbent.max, incumbent.winners.len())

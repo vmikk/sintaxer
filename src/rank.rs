@@ -21,8 +21,8 @@ const LANES: usize = TILE / 64;
 /// just below the word universe, so 17 planes is enough.
 const PLANE_CAP: usize = 17;
 
-/// Marks a word absent from the query in the reverse lookup table.
-const ABSENT: u16 = u16::MAX;
+/// Vocabularies must stay below this so every position and count fits a `u16`.
+const VOCABULARY_CAP: usize = u16::MAX as usize;
 
 /// Add `2^shift` into bit-sliced counters wherever `input` has a bit set.
 ///
@@ -214,7 +214,7 @@ fn plane_max(planes: &[u64], lanes: usize, depth: usize, valid: &[u64]) -> (u32,
 /// Per-worker scratch buffers, reused across queries.
 ///
 /// A few small allocations remain: [`Workspace::rank`] builds a `Vec<Row>` per
-/// call, and each [`plane_max`] call returns a `Vec` owned by [`Top`].
+/// call, and each `plane_max` call returns a `Vec` owned by [`Top`].
 pub struct Workspace {
     planes: Vec<u64>,
     tile: Vec<u64>,
@@ -225,12 +225,13 @@ pub struct Workspace {
     /// One carry bitmap per level, produced by [`csa_fold`].
     carries: Vec<u64>,
     cursors: Vec<usize>,
-    lookup: Box<[u16; WORDS]>,
-    /// Small presence bitmap checked before `lookup`.
-    ///
-    /// Most probes miss, so this keeps the common case in L1.
+    /// The query vocabulary as a bitmap over the whole word universe (8 KiB, fits L1).
     present: Box<[u64; WORDS / 64]>,
-    touched: Vec<u16>,
+    /// Number of vocabulary words below each 64-word block of `present`.
+    ///
+    /// The vocabulary is ascending, so a word's position is this prefix plus the
+    /// popcount of lower set bits in its block.
+    prefix: Box<[u16; WORDS / 64]>,
     matrix: Vec<u64>,
     candidate_planes: Vec<u64>,
     carry: Vec<u64>,
@@ -239,6 +240,10 @@ pub struct Workspace {
     pub counts: Vec<u16>,
     /// `histogram[v]` is the number of references whose count is `v`.
     pub histogram: Vec<u32>,
+    /// Largest count in each run of 64 references, so [`Workspace::select`] can skip
+    /// runs with no candidate. After [`Workspace::exclude`] it is only an upper
+    /// bound, which keeps selection exact.
+    lane_max: Vec<u16>,
     /// References selected for the bootstrap phase, ascending.
     pub candidates: Vec<u32>,
     /// `log2(weight)` per query-vocabulary position, parallel to the words given to `project`.
@@ -256,15 +261,15 @@ impl Default for Workspace {
             occupied: vec![0; LEVELS],
             carries: vec![0; LEVELS * LANES],
             cursors: Vec::new(),
-            lookup: Box::new([ABSENT; WORDS]),
             present: Box::new([0; WORDS / 64]),
-            touched: Vec::new(),
+            prefix: Box::new([0; WORDS / 64]),
             matrix: Vec::new(),
             candidate_planes: Vec::new(),
             carry: Vec::new(),
             valid: Vec::new(),
             counts: Vec::new(),
             histogram: Vec::new(),
+            lane_max: Vec::new(),
             candidates: Vec::new(),
             shifts: Vec::new(),
             depth: depth_for(SAMPLE_SIZE),
@@ -284,7 +289,7 @@ impl Workspace {
     /// directly. Each tile's counts are written and histogrammed while still hot.
     pub fn rank(&mut self, index: &Index, words: &[u16]) -> Result<()> {
         ensure!(!words.is_empty(), "empty query vocabulary");
-        ensure!(words.len() < ABSENT as usize, "query vocabulary too large");
+        ensure!(words.len() < VOCABULARY_CAP, "query vocabulary too large");
         let n = index.references;
 
         // Group rows by storage so each kernel gets one contiguous slice; order within
@@ -313,6 +318,8 @@ impl Workspace {
         self.cursors.resize(blocked.len() + plain.len(), 0);
         self.histogram.clear();
         self.histogram.resize(words.len() + 1, 0);
+        // Every entry is assigned by the tile loop.
+        self.lane_max.resize(n.div_ceil(64), 0);
 
         let Self {
             planes,
@@ -323,6 +330,7 @@ impl Workspace {
             cursors,
             counts,
             histogram,
+            lane_max,
             carry,
             ..
         } = self;
@@ -406,6 +414,9 @@ impl Workspace {
             for &count in counts.iter() {
                 histogram[count as usize] += 1;
             }
+            for (max, lane) in lane_max[start / 64..].iter_mut().zip(counts.chunks(64)) {
+                *max = lane.iter().copied().max().unwrap_or(0);
+            }
             start += TILE;
         }
         Ok(())
@@ -447,9 +458,15 @@ impl Workspace {
         // Count 0 means no shared words; such a reference can never win.
         let threshold = threshold.max(1) as u16;
         self.candidates.clear();
-        for (reference, &count) in self.counts.iter().enumerate() {
-            if count >= threshold {
-                self.candidates.push(reference as u32);
+        // Candidates occupy few runs, so most of `counts` is never read.
+        for ((lane, &max), counts) in self.lane_max.iter().enumerate().zip(self.counts.chunks(64)) {
+            if max < threshold {
+                continue;
+            }
+            for (offset, &count) in counts.iter().enumerate() {
+                if count >= threshold {
+                    self.candidates.push((lane * 64 + offset) as u32);
+                }
             }
         }
         threshold
@@ -458,21 +475,26 @@ impl Workspace {
     /// Build the word-major membership matrix for the selected candidates.
     ///
     /// Each row is a bitmap over candidates that can be added straight into
-    /// the counter planes during the bootstrap.
+    /// the counter planes during the bootstrap. `words` must be ascending and
+    /// distinct, as from [`vocabulary`] and [`revcomp_vocabulary`].
     pub fn project(&mut self, index: &Index, words: &[u16], weights: &weight::Table) -> Result<()> {
-        for &word in &self.touched {
-            self.lookup[word as usize] = ABSENT;
-            self.present[word as usize / 64] &= !(1 << (word % 64));
-        }
-        self.touched.clear();
-        ensure!(words.len() < ABSENT as usize, "query vocabulary too large");
+        ensure!(words.len() < VOCABULARY_CAP, "query vocabulary too large");
+        ensure!(
+            words.windows(2).all(|pair| pair[0] < pair[1]),
+            "query vocabulary must be ascending and distinct"
+        );
+        self.present.fill(0);
         self.shifts.clear();
         self.shifts.reserve(words.len());
-        for (i, &word) in words.iter().enumerate() {
-            self.lookup[word as usize] = i as u16;
+        for &word in words {
             self.present[word as usize / 64] |= 1 << (word % 64);
-            self.touched.push(word);
             self.shifts.push(weights.get(word).trailing_zeros() as u8);
+        }
+        // Below the cap, so the running total can't overflow.
+        let mut below = 0u16;
+        for (prefix, bits) in self.prefix.iter_mut().zip(self.present.iter()) {
+            *prefix = below;
+            below += bits.count_ones() as u16;
         }
         self.depth = depth_for(SAMPLE_SIZE * weights.max() as usize);
         debug_assert!(self.depth <= PLANE_CAP);
@@ -482,13 +504,16 @@ impl Workspace {
         self.matrix.resize(words.len() * lanes, 0);
         for (position, &reference) in self.candidates.iter().enumerate() {
             let (lane, bit) = (position / 64, position % 64);
-            let (present, lookup, matrix) = (&self.present, &self.lookup, &mut self.matrix);
+            let (present, prefix, matrix) = (&self.present, &self.prefix, &mut self.matrix);
             index.visit_kmers(reference as usize, |word| {
-                if present[word as usize / 64] >> (word % 64) & 1 == 0 {
+                let (block, offset) = (word as usize / 64, word % 64);
+                let bits = present[block];
+                if bits >> offset & 1 == 0 {
                     return;
                 }
-                let index = lookup[word as usize];
-                matrix[index as usize * lanes + lane] |= 1 << bit;
+                let position =
+                    prefix[block] as usize + (bits & ((1u64 << offset) - 1)).count_ones() as usize;
+                matrix[position * lanes + lane] |= 1 << bit;
             })?;
         }
         Ok(())

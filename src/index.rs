@@ -1,4 +1,4 @@
-//! Immutable, memory-mapped STX2 index.
+//! Immutable, memory-mapped `.stx` index.
 use crate::{ALGORITHM_VERSION, K, TILE, WORDS, input, sequence, taxonomy::TreeBuilder};
 use anyhow::{Context, Result, ensure};
 use memmap2::{Mmap, MmapMut};

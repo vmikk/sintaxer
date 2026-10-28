@@ -45,7 +45,7 @@ enum Command {
         seed: u64,
         #[arg(long, default_value_t = 0.8)]
         cutoff: f64,
-        #[arg(long, value_enum, default_value_t = Strand::Both)]
+        #[arg(long, value_enum, default_value_t = Strand::Plus)]
         strand: Strand,
         /// Score every reference in every replicate, as published SINTAX does (slower).
         #[arg(long)]
@@ -181,6 +181,8 @@ struct BatchResult {
     reads: usize,
     bases: usize,
     escalated: usize,
+    /// Queries whose reverse strand `--strand both` could skip.
+    skipped: usize,
     /// Queries with a rank where the unnamed bloc matched or beat the best named
     /// taxon; the ranks `--support adjusted` acts on.
     contested: usize,
@@ -202,6 +204,7 @@ fn process(
         reads: 0,
         bases: 0,
         escalated: 0,
+        skipped: 0,
         contested: 0,
         timings: Timings::default(),
     };
@@ -251,6 +254,9 @@ fn process(
         result.timings.scoring += times.scoring;
         result.timings.rank += times.rank;
         result.timings.taxonomy += times.taxonomy;
+        result.skipped += usize::from(times.reverse_skipped);
+        result.timings.candidates += times.candidates;
+        result.timings.candidate_strands += times.candidate_strands;
     }
     Ok(result)
 }
@@ -316,7 +322,7 @@ fn run_classify(
         writer.write_all(classify::FEATURE_HEADER.as_bytes())?;
     }
     let (mut total_reads, mut total_bases, mut escalated) = (0usize, 0usize, 0usize);
-    let mut contested = 0usize;
+    let (mut contested, mut skipped) = (0usize, 0usize);
     let mut totals = Timings::default();
     let (mut parsing, mut writing) = (Duration::ZERO, Duration::ZERO);
     let mut first_result = None;
@@ -412,6 +418,9 @@ fn run_classify(
                     total_bases += result.bases;
                     escalated += result.escalated;
                     contested += result.contested;
+                    skipped += result.skipped;
+                    totals.candidates += result.timings.candidates;
+                    totals.candidate_strands += result.timings.candidate_strands;
                     totals.extraction += result.timings.extraction;
                     totals.sampling += result.timings.sampling;
                     totals.scoring += result.timings.scoring;
@@ -461,6 +470,21 @@ fn run_classify(
             "escalated_queries={escalated} escalated_pct={:.3}",
             if total_reads > 0 {
                 100.0 * escalated as f64 / total_reads as f64
+            } else {
+                0.0
+            }
+        );
+        // Mean candidate-set size (ties can push it past `--candidates`), and how often
+        // `--strand both` could skip the reverse strand.
+        eprintln!(
+            "candidates_mean={:.1} reverse_skipped_queries={skipped} reverse_skipped_pct={:.3}",
+            if totals.candidate_strands > 0 {
+                totals.candidates as f64 / totals.candidate_strands as f64
+            } else {
+                0.0
+            },
+            if total_reads > 0 {
+                100.0 * skipped as f64 / total_reads as f64
             } else {
                 0.0
             }

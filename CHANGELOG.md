@@ -1,4 +1,15 @@
-## [0.11.0]
+
+## [0.12.0]
+
+### Added
+- `--profile` now also reports the mean candidate-set size and how many queries had their reverse strand skipped.
+
+### Changed
+- `classify` now defaults to `--strand plus` and scores only the query as given. Pass `--strand both` for input of mixed orientation.
+
+### Performance
+- Under `--strand both`, the reverse strand is skipped whenever it provably cannot beat the forward result.
+- The single-strand default roughly halves the work per query on oriented amplicons and lowers peak memory.
 
 ### Changed
 - Index format bumped to 5 (blocked posting rows); rebuild existing indexes. Indexes come out roughly a third smaller.

@@ -331,6 +331,8 @@ pub struct Workspace {
     scores: Vec<u8>,
     forward: Vec<u16>,
     reverse: Vec<u16>,
+    /// Forward vocabularies of a batch, held while the batch is ranked.
+    queued: Vec<Vec<u16>>,
     seen: Box<[u64; WORDS / 64]>,
 }
 
@@ -342,6 +344,7 @@ impl Default for Workspace {
             scores: Vec::new(),
             forward: Vec::new(),
             reverse: Vec::new(),
+            queued: Vec::new(),
             seen: Box::new([0; WORDS / 64]),
         }
     }
@@ -558,6 +561,11 @@ pub fn hide_for(config: &Config, locator: &Locator, label: &str) -> Result<Optio
     Ok(locator.locate(&lineage)[rank].map(|node| Hide::Clade { node, rank }))
 }
 
+/// Whether a query-strand uses the candidate path rather than the exact one.
+fn ranks_candidates(index: &Index, config: &Config, hide: Option<Hide>) -> bool {
+    (!config.exact && index.references > config.candidates.saturating_mul(4)) || hide.is_some()
+}
+
 /// Score every replicate of one strand, exactly or against candidates.
 #[allow(clippy::too_many_arguments)]
 fn score_strand(
@@ -569,6 +577,7 @@ fn score_strand(
     config: &Config,
     weights: &weight::Table,
     hide: Option<Hide>,
+    ranked: Option<usize>,
     ws: &mut Workspace,
 ) -> Result<Outcome> {
     let mut escalated = false;
@@ -576,15 +585,20 @@ fn score_strand(
     // With a candidate set that is a large share of the database, the rank pass and
     // projection cost more than scoring everything, so small databases go exact.
     // Hiding only works on the candidate path, so it always takes it.
-    let worth_it =
-        (!config.exact && index.references > config.candidates.saturating_mul(4)) || hide.is_some();
+    let worth_it = ranks_candidates(index, config, hide);
     let mut from_candidates = worth_it;
     let mut tops = if !worth_it {
         exact_tops(index, words, samples, weights, ws)?
     } else {
-        let start = Instant::now();
-        ws.rank.rank(index, words)?;
-        ranking += start.elapsed();
+        match ranked {
+            // Already swept with its batch.
+            Some(slot) => ws.rank.adopt(slot),
+            None => {
+                let start = Instant::now();
+                ws.rank.rank(index, words)?;
+                ranking += start.elapsed();
+            }
+        }
         if let Some(hide) = hide {
             let vocabulary = words.len();
             ws.rank
@@ -610,7 +624,7 @@ fn score_strand(
                 .iter()
                 .all(|&r| ws.rank.counts[r as usize] <= threshold);
             let risky = config.risk > 0.0
-                && strand_risk(&tops, &ws.rank.histogram, threshold, words.len()) > config.risk;
+                && strand_risk(&tops, &ws.rank.histogram(), threshold, words.len()) > config.risk;
             if !oversized && !unseparated && !risky {
                 break tops;
             }
@@ -690,15 +704,42 @@ fn best_strand(
     ws: &mut Workspace,
     timings: &mut Timings,
 ) -> Result<Option<(Outcome, char)>> {
+    let Some(key) = prepare(sequence, config, ws, timings) else {
+        return Ok(None);
+    };
+    strands(index, &key, config, weights, hide, None, ws, timings)
+}
+
+/// Extract a query's forward vocabulary into `ws.forward` and derive its RNG key.
+/// `None` when it has too few distinct words to sample from.
+fn prepare(
+    sequence: &[u8],
+    config: &Config,
+    ws: &mut Workspace,
+    timings: &mut Timings,
+) -> Option<blake3::Hash> {
     let start = Instant::now();
     let (normalized, unknown) = sequence::normalize(sequence);
     rank::vocabulary(&normalized, &mut ws.seen, &mut ws.forward);
     timings.extraction += start.elapsed();
     timings.unknown_bases += unknown;
-    if ws.forward.len() < SAMPLE_SIZE {
-        return Ok(None);
-    }
-    let key = rng::query_key(config.seed, &normalized);
+    (ws.forward.len() >= SAMPLE_SIZE).then(|| rng::query_key(config.seed, &normalized))
+}
+
+/// The strand loop of [`best_strand`] for an already [`prepare`]d query. `ranked` is
+/// its batch slot when [`classify_batch`] has swept it.
+#[allow(clippy::too_many_arguments)]
+fn strands(
+    index: &Index,
+    key: &blake3::Hash,
+    config: &Config,
+    weights: &weight::Table,
+    hide: Option<Hide>,
+    ranked: Option<usize>,
+    ws: &mut Workspace,
+    timings: &mut Timings,
+) -> Result<Option<(Outcome, char)>> {
+    let key = *key;
     let mut best: Option<(Outcome, char)> = None;
     for strand in 0..if config.strand == Strand::Both { 2 } else { 1 } {
         if strand == 1
@@ -727,8 +768,9 @@ fn best_strand(
         timings.sampling += start.elapsed();
 
         let start = Instant::now();
+        let ranked = if strand == 0 { ranked } else { None };
         let outcome = score_strand(
-            index, &words, &samples, &key, strand, config, weights, hide, ws,
+            index, &words, &samples, &key, strand, config, weights, hide, ranked, ws,
         );
         timings.scoring += start.elapsed();
         if strand == 0 {
@@ -777,20 +819,122 @@ pub fn classify(
     else {
         return Ok((Prediction::unclassified(), timings));
     };
+    let prediction = predict(index, &outcome, strand, config, params, ws, &mut timings);
+    Ok((prediction, timings))
+}
+
+/// Queries [`classify_batch`] sweeps together, so shared index rows are read once per batch.
+pub const BATCH: usize = 2;
+
+/// [`classify`] for several queries, with their forward rank sweeps done in one pass.
+/// Results are identical to calling [`classify`] per query; anything the batch cannot
+/// handle falls back to the single-query path.
+pub fn classify_batch(
+    index: &Index,
+    sequences: &[&[u8]],
+    config: &Config,
+    weights: &weight::Table,
+    params: Option<&protax::Params>,
+    hides: &[Option<Hide>],
+    ws: &mut Workspace,
+) -> Vec<Result<(Prediction, Timings)>> {
+    assert_eq!(sequences.len(), hides.len(), "one hide per query");
+    let one_by_one = |ws: &mut Workspace| {
+        sequences
+            .iter()
+            .zip(hides)
+            .map(|(sequence, &hide)| classify(index, sequence, config, weights, params, hide, ws))
+            .collect()
+    };
+    let ready = config.validate().is_ok()
+        && weights.source() == config.weights
+        && (config.scorer == Scorer::Sintax || params.is_some());
+    if !ready || sequences.len() < 2 {
+        return one_by_one(ws);
+    }
+
+    // Extract vocabularies and assign batch slots.
+    let mut timings = vec![Timings::default(); sequences.len()];
+    let mut keys = Vec::with_capacity(sequences.len());
+    let mut slots = vec![None; sequences.len()];
+    if ws.queued.len() < sequences.len() {
+        ws.queued.resize_with(sequences.len(), Vec::new);
+    }
+    let mut swept = 0;
+    for (i, sequence) in sequences.iter().enumerate() {
+        let key = prepare(sequence, config, ws, &mut timings[i]);
+        std::mem::swap(&mut ws.forward, &mut ws.queued[i]);
+        if key.is_some() && ranks_candidates(index, config, hides[i]) {
+            slots[i] = Some(swept);
+            swept += 1;
+        }
+        keys.push(key);
+    }
+    let start = Instant::now();
+    let vocabularies: Vec<&[u16]> = (0..sequences.len())
+        .filter(|&i| slots[i].is_some())
+        .map(|i| &ws.queued[i][..])
+        .collect();
+    if ws.rank.rank_batch(index, &vocabularies).is_err() {
+        return one_by_one(ws);
+    }
+    // Split the shared sweep time evenly between queries.
+    let share = start.elapsed() / swept.max(1) as u32;
+
+    let mut results = Vec::with_capacity(sequences.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        let mut timings = std::mem::take(&mut timings[i]);
+        let Some(key) = key else {
+            results.push(Ok((Prediction::unclassified(), timings)));
+            continue;
+        };
+        if slots[i].is_some() {
+            timings.rank += share;
+            timings.scoring += share;
+        }
+        std::mem::swap(&mut ws.forward, &mut ws.queued[i]);
+        let result = strands(
+            index,
+            &key,
+            config,
+            weights,
+            hides[i],
+            slots[i],
+            ws,
+            &mut timings,
+        )
+        .map(|best| match best {
+            Some((outcome, strand)) => {
+                let prediction = predict(index, &outcome, strand, config, params, ws, &mut timings);
+                (prediction, timings)
+            }
+            // Unreachable: strand zero is always scored.
+            None => (Prediction::unclassified(), timings),
+        });
+        results.push(result);
+    }
+    results
+}
+
+/// Turn the winning strand's evidence into a prediction under the configured scorer.
+fn predict(
+    index: &Index,
+    outcome: &Outcome,
+    strand: char,
+    config: &Config,
+    params: Option<&protax::Params>,
+    ws: &mut Workspace,
+    timings: &mut Timings,
+) -> Prediction {
     let start = Instant::now();
     let prediction = match config.scorer {
         Scorer::Sintax => consensus(index, &outcome.winners, strand),
-        Scorer::Protax => protax_consensus(
-            index,
-            &outcome,
-            strand,
-            config,
-            params.expect("checked"),
-            ws,
-        ),
+        Scorer::Protax => {
+            protax_consensus(index, outcome, strand, config, params.expect("checked"), ws)
+        }
     };
     timings.taxonomy += start.elapsed();
-    Ok((prediction, timings))
+    prediction
 }
 
 /// Turn one strand's evidence into a lineage under [`Scorer::Protax`].

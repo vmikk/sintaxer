@@ -28,37 +28,71 @@ const H_NODE_STATS: usize = 192;
 /// Every k-mer of a packed record, in sequence order, duplicates included.
 ///
 /// Shared by [`Index::visit_kmers`] and [`Index::reference_words`]; an ambiguous
-/// base breaks the window. Works run by run of unambiguous bases, one packed byte at a time.
+/// base breaks the window. Words are read from 64-bit loads with bases reversed
+/// so the first base is in the top pair, giving each word as a single shift.
 fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnMut(u16)) {
+    // Words per 64-bit load: up to `32 - K + 1`, rounded down to a multiple of four
+    // so the next load stays byte-aligned.
+    const CHUNK: usize = (32 - K + 1) / 4 * 4;
     let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
     let mut next_break = breaks.next().unwrap_or(usize::MAX);
     let mut at = 0;
     while at < bases {
-        // This run of unambiguous bases is `at .. end`; the window starts empty.
+        // This run of unambiguous bases is `at .. end`.
         let end = next_break.min(bases);
-        let mut word = 0u16;
-        // The first `K - 1` bases of a run only fill the window.
-        let prologue = end.min(at + K - 1);
-        while at < prologue {
-            word = (word << 2) | u16::from((packed[at / 4] >> ((at % 4) * 2)) & 3);
-            at += 1;
-        }
-        // From here every base completes a word.
-        while at < end {
-            let byte = packed[at / 4];
-            let stop = end.min(at + 4 - at % 4);
-            let mut shift = (at % 4) * 2;
-            while at < stop {
-                word = (word << 2) | u16::from((byte >> shift) & 3);
-                visit(word);
-                at += 1;
-                shift += 2;
+        if end >= at + K {
+            // Start of the run's last word.
+            let last = end - K;
+            let mut start = at;
+            while start <= last {
+                let byte = start / 4;
+                // Shift each word into the top sixteen bits in turn.
+                let mut y = reversed_pairs(packed, byte);
+                if start % 4 == 0 && start + CHUNK <= last + 1 {
+                    // Common case, a whole chunk: constant trip count, so it unrolls.
+                    for _ in 0..CHUNK {
+                        visit((y >> (64 - 2 * K)) as u16);
+                        y <<= 2;
+                    }
+                    start += CHUNK;
+                } else {
+                    // A run's first chunk (which realigns it) or its last: words starting
+                    // `first ..= stop` bases into the load.
+                    let first = start % 4;
+                    let stop = (last - byte * 4).min(CHUNK - 1);
+                    y <<= 2 * first;
+                    for _ in 0..stop + 1 - first {
+                        visit((y >> (64 - 2 * K)) as u16);
+                        y <<= 2;
+                    }
+                    start = byte * 4 + stop + 1;
+                }
             }
         }
         // Step over the ambiguous base and start a fresh window.
         at = end + 1;
         next_break = breaks.next().unwrap_or(usize::MAX);
     }
+}
+
+/// The 32 bases packed from `byte` on, first base in the top pair.
+///
+/// Bytes past the record read as zero; they only fill bases after the run's last word.
+#[inline(always)]
+fn reversed_pairs(packed: &[u8], byte: usize) -> u64 {
+    let x = match packed.get(byte..byte + 8) {
+        Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
+        None => {
+            let mut bytes = [0u8; 8];
+            let rest = packed.get(byte..).unwrap_or_default();
+            bytes[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(bytes)
+        }
+    };
+    // Reverse the four pairs within each byte, then the bytes.
+    let x = ((x >> 2) & 0x3333_3333_3333_3333) | ((x & 0x3333_3333_3333_3333) << 2);
+    let x = ((x >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((x & 0x0F0F_0F0F_0F0F_0F0F) << 4);
+    x.swap_bytes()
 }
 
 fn u16_at(b: &[u8], p: usize) -> u16 {
@@ -264,6 +298,12 @@ pub struct Row<'a> {
     pub layout: Layout,
     pub count: usize,
 }
+impl<'a> Row<'a> {
+    /// Bytes of this row, for kernels that walk it with their own cursor.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.data
+    }
+}
 impl Row<'_> {
     fn id(&self, i: usize) -> usize {
         u32_at(self.data, i * 4) as usize
@@ -355,17 +395,18 @@ impl Row<'_> {
         *cursor = i;
     }
 
-    /// Add one to `counts[local]` for every posting of this blocked row in the next
-    /// tile, and advance `cursor` (a byte offset, starting at zero) past its block.
-    /// Every tile has a block, even empty ones, so no seeking is needed.
-    pub fn blocked_tile(&self, counts: &mut [u16], cursor: &mut usize) {
-        debug_assert_eq!(self.layout, Layout::Blocked);
-        let block = u16_at(self.data, *cursor) as usize;
-        let at = *cursor + 2;
-        for local in self.data[at..at + block * 2].chunks_exact(2) {
-            counts[u16::from_le_bytes(local.try_into().unwrap()) as usize] += 1;
+    /// Add one to `counts[local]` for every posting in one blocked row's block
+    /// (`postings` excludes the count).
+    ///
+    /// The mask is a no-op, since [`Index::row`] validated every offset, but it lets
+    /// the compiler drop the bounds check.
+    #[inline(always)]
+    pub fn block_increment(postings: &[u8], counts: &mut [u16; TILE]) {
+        const { assert!(TILE.is_power_of_two()) };
+        for local in postings.chunks_exact(2) {
+            let local = u16::from_le_bytes(local.try_into().unwrap()) as usize;
+            counts[local & (TILE - 1)] += 1;
         }
-        *cursor = at + block * 2;
     }
 
     /// Membership bits for a whole tile of a dense row, in one bulk read.

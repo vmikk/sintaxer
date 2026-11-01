@@ -197,6 +197,7 @@ fn process(
     params: Option<&protax::Params>,
     locator: Option<&Locator>,
     batch: Vec<Record>,
+    group: usize,
     workspace: &mut Workspace,
 ) -> Result<BatchResult> {
     let mut result = BatchResult {
@@ -208,44 +209,8 @@ fn process(
         contested: 0,
         timings: Timings::default(),
     };
-    for record in batch {
-        let context = || format!("query {:?}", record.label);
-        let times = if config.emit_features {
-            let (rows, times) = classify::training_rows(
-                index,
-                &record.sequence,
-                &record.label,
-                config,
-                weights,
-                locator.expect("--emit-features builds a locator"),
-                workspace,
-            )
-            .with_context(context)?;
-            result.output.push_str(&rows);
-            times
-        } else {
-            let hide = match locator {
-                Some(locator) => {
-                    classify::hide_for(config, locator, &record.label).with_context(context)?
-                }
-                None => None,
-            };
-            let (prediction, times) = classify::classify(
-                index,
-                &record.sequence,
-                config,
-                weights,
-                params,
-                hide,
-                workspace,
-            )
-            .with_context(context)?;
-            result.contested += usize::from(prediction.abstention_pluralities > 0);
-            result
-                .output
-                .push_str(&prediction.tsv(&record.label, config));
-            times
-        };
+    let context = |record: &Record| format!("query {:?}", record.label);
+    let tally = |result: &mut BatchResult, record: &Record, times: &Timings| {
         result.reads += 1;
         result.bases += record.sequence.len();
         result.escalated += usize::from(times.escalated);
@@ -257,6 +222,47 @@ fn process(
         result.skipped += usize::from(times.reverse_skipped);
         result.timings.candidates += times.candidates;
         result.timings.candidate_strands += times.candidate_strands;
+    };
+    if config.emit_features {
+        for record in &batch {
+            let (rows, times) = classify::training_rows(
+                index,
+                &record.sequence,
+                &record.label,
+                config,
+                weights,
+                locator.expect("--emit-features builds a locator"),
+                workspace,
+            )
+            .with_context(|| context(record))?;
+            result.output.push_str(&rows);
+            tally(&mut result, record, &times);
+        }
+        return Ok(result);
+    }
+    // Queries are classified `group` at a time so their rank sweeps share one pass
+    // over the index; output order is unchanged.
+    for records in batch.chunks(group.max(1)) {
+        let mut hides = Vec::with_capacity(records.len());
+        for record in records {
+            hides.push(match locator {
+                Some(locator) => classify::hide_for(config, locator, &record.label)
+                    .with_context(|| context(record))?,
+                None => None,
+            });
+        }
+        let sequences: Vec<&[u8]> = records.iter().map(|r| &r.sequence[..]).collect();
+        let results = classify::classify_batch(
+            index, &sequences, config, weights, params, &hides, workspace,
+        );
+        for (record, outcome) in records.iter().zip(results) {
+            let (prediction, times) = outcome.with_context(|| context(record))?;
+            result.contested += usize::from(prediction.abstention_pluralities > 0);
+            result
+                .output
+                .push_str(&prediction.tsv(&record.label, config));
+            tally(&mut result, record, &times);
+        }
     }
     Ok(result)
 }
@@ -294,6 +300,8 @@ fn run_classify(
         }
     };
     let open_time = wall.elapsed();
+    // Queries per shared rank sweep.
+    let group = classify::BATCH;
     let mut reader = input::reader(reads)?;
     // File outputs are written atomically; a failure leaves any old output intact.
     let parent = output
@@ -352,6 +360,7 @@ fn run_classify(
                                     params,
                                     locator,
                                     batch,
+                                    group,
                                     &mut workspace,
                                 ))
                                 .is_err()

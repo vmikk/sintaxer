@@ -1,7 +1,7 @@
 //! Per-word integer weights for the scoring stage.
 //!
 //! Only scoring is weighted, never the rank pass. Weights are powers of two, so
-//! adding one is a single `ripple_add` from plane `s`, and tiers are chosen by
+//! adding one is a single `ripple_add_dense` from plane `s`, and tiers are chosen by
 //! integer comparison only, so results never depend on platform libm.
 use crate::{WORDS, index::Index};
 use anyhow::{Result, ensure};

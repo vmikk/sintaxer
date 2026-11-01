@@ -1,4 +1,11 @@
 
+## [0.13.0]
+
+### Performance
+- Queries are now classified in pairs that share a single rank sweep over the index; output order and results are unchanged.
+- K-mer decoding of packed reference sequences reads whole 64-bit words instead of rolling one base at a time.
+- Tighter blocked-row walk, candidate selection and replicate kernels; noticeably faster overall, most of all on one or four threads.
+
 ## [0.12.0]
 
 ### Added

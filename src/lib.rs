@@ -1,4 +1,5 @@
 //! Deterministic, versioned SINTAX-style classification.
+pub mod bits;
 pub mod classify;
 pub mod curate;
 pub mod index;

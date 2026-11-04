@@ -440,6 +440,68 @@ impl Row<'_> {
         }
     }
 
+    /// Raw bytes of `lanes` lanes of a dense row from `start`, if the row holds
+    /// them all, for reading the bitmap in place.
+    pub fn dense_bytes(&self, start: usize, lanes: usize) -> Option<&[u8]> {
+        debug_assert_eq!(self.layout, Layout::Bitmap);
+        let off = start / 8;
+        self.data.get(off..off + lanes * 8)
+    }
+
+    /// Membership bits of one tile of this row, any layout: bit `i` of `out`
+    /// is reference `start + i`. `out` is overwritten in full.
+    ///
+    /// Sparse rows advance `cursor`, so tiles must be visited in ascending
+    /// order, each once; skip unwanted ones with [`Row::skip_tile`].
+    pub fn tile_bits(&self, start: usize, cursor: &mut usize, out: &mut [u64]) {
+        debug_assert!(start.is_multiple_of(TILE));
+        match self.layout {
+            Layout::Bitmap => self.dense_tile(start, out),
+            Layout::Blocked => {
+                out.fill(0);
+                let block = u16_at(self.data, *cursor) as usize;
+                let at = *cursor + 2;
+                for local in self.data[at..at + block * 2].chunks_exact(2) {
+                    let local = u16::from_le_bytes([local[0], local[1]]) as usize;
+                    out[local / 64] |= 1 << (local % 64);
+                }
+                *cursor = at + block * 2;
+            }
+            Layout::Postings => {
+                out.fill(0);
+                let end = start + TILE;
+                let mut i = *cursor;
+                while i < self.count {
+                    let id = self.id(i);
+                    if id >= end {
+                        break;
+                    }
+                    let local = id - start;
+                    out[local / 64] |= 1 << (local % 64);
+                    i += 1;
+                }
+                *cursor = i;
+            }
+        }
+    }
+
+    /// Advance a sparse row's cursor past the tile at `start` without reading it.
+    pub fn skip_tile(&self, start: usize, cursor: &mut usize) {
+        match self.layout {
+            Layout::Bitmap => {}
+            Layout::Blocked => {
+                let block = u16_at(self.data, *cursor) as usize;
+                *cursor += 2 + block * 2;
+            }
+            Layout::Postings => {
+                let end = start + TILE;
+                while *cursor < self.count && self.id(*cursor) < end {
+                    *cursor += 1;
+                }
+            }
+        }
+    }
+
     /// Membership bits for 64 references of a bitmap row; `start` must be a
     /// multiple of 64. Used by [`Row::visit`].
     fn bits64(&self, start: usize) -> u64 {
@@ -862,6 +924,12 @@ impl Index {
     /// Bytes held by the packed reference sequences, directory included.
     pub fn sequence_bytes(&self) -> usize {
         self.seq_len + (self.references + 1) * 8
+    }
+    /// Rough mean bases per reference from the packed payload size. Only used
+    /// for cost estimates, never for scoring.
+    pub fn mean_bases(&self) -> usize {
+        let packed = self.seq_len.saturating_sub(self.references * 8);
+        (packed * 4).checked_div(self.references).unwrap_or(0)
     }
     pub fn file_bytes(&self) -> usize {
         self.map.len()

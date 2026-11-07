@@ -68,6 +68,20 @@ impl Holdout {
     }
 }
 
+/// How the candidate path scores a candidate set. Both give identical
+/// results; this is a speed choice only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Projection {
+    /// Estimate both costs and take the cheaper.
+    Auto,
+    /// Decode candidate sequences and count over candidate positions. Best on
+    /// large databases.
+    Sequence,
+    /// Count straight from the index rows, masked to the candidates. Best on
+    /// small and mid-sized databases.
+    Rows,
+}
+
 /// What a per-rank confidence is a fraction of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Support {
@@ -108,6 +122,8 @@ pub struct Config {
     pub holdout: Option<Holdout>,
     /// Write design-matrix rows instead of calls.
     pub emit_features: bool,
+    /// How the candidate path scores its candidates.
+    pub projection: Projection,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -127,6 +143,7 @@ impl Default for Config {
             floor: 0.001,
             holdout: None,
             emit_features: false,
+            projection: Projection::Auto,
         }
     }
 }
@@ -328,7 +345,7 @@ impl Prediction {
 pub struct Workspace {
     rank: rank::Workspace,
     protax: protax::Workspace,
-    scores: Vec<u8>,
+    engine: scoring::Engine,
     forward: Vec<u16>,
     reverse: Vec<u16>,
     /// Forward vocabularies of a batch, held while the batch is ranked.
@@ -341,7 +358,7 @@ impl Default for Workspace {
         Self {
             rank: rank::Workspace::default(),
             protax: protax::Workspace::default(),
-            scores: Vec::new(),
+            engine: scoring::Engine::default(),
             forward: Vec::new(),
             reverse: Vec::new(),
             queued: Vec::new(),
@@ -355,10 +372,12 @@ impl Default for Workspace {
 /// Positions rather than word codes, so the exact and candidate paths consume the
 /// RNG identically and stay comparable.
 pub fn samples(vocabulary: usize, key: &blake3::Hash, strand: u8) -> Vec<[u16; SAMPLE_SIZE]> {
+    // All draws share one range, so set it up once.
+    let uniform = rng::Uniform::new(vocabulary as u64);
     (0..BOOTSTRAPS)
         .map(|boot| {
             let mut rng = rng::stream(key, strand, boot, 0);
-            std::array::from_fn(|_| rng.bounded(vocabulary as u64) as u16)
+            std::array::from_fn(|_| uniform.sample(&mut rng) as u16)
         })
         .collect()
 }
@@ -488,13 +507,15 @@ fn exact_tops(
     weights: &weight::Table,
     ws: &mut Workspace,
 ) -> Result<Vec<scoring::Top>> {
-    let mut tops = Vec::with_capacity(BOOTSTRAPS);
-    for sample in samples {
-        let codes: [u16; SAMPLE_SIZE] = std::array::from_fn(|i| words[sample[i] as usize]);
-        scoring::scalar_scores(index, &codes, weights, &mut ws.scores)?;
-        tops.push(scoring::Top::from_scores(&ws.scores));
-    }
-    Ok(tops)
+    scoring::bitsliced_tops(
+        index,
+        words,
+        samples,
+        weights,
+        scoring::Eligible::All,
+        false,
+        &mut ws.engine,
+    )
 }
 
 /// Expected number of replicates whose winner could have differed had the pruned
@@ -566,6 +587,47 @@ fn ranks_candidates(index: &Index, config: &Config, hide: Option<Hide>) -> bool 
     (!config.exact && index.references > config.candidates.saturating_mul(4)) || hide.is_some()
 }
 
+/// The index space a replicate's tie mask is written in.
+#[derive(Clone, Copy)]
+enum Coordinates {
+    /// Positions in the candidate list, as [`rank::Workspace::replicate`]
+    /// writes them.
+    Candidates,
+    /// Reference ids, as [`scoring::bitsliced_tops`] writes them.
+    References,
+}
+
+/// Choose how to score one strand's candidate set, from a rough cost model.
+/// A poor estimate costs time, never a different call.
+fn projection_for(
+    index: &Index,
+    config: &Config,
+    words: &[u16],
+    samples: &[[u16; SAMPLE_SIZE]],
+    rank: &rank::Workspace,
+) -> Projection {
+    if config.projection != Projection::Auto {
+        return config.projection;
+    }
+    // Rough cycles per lane-row materialised, lane counted and base decoded.
+    const MATERIALISE_LANE: usize = 8;
+    const COUNT_LANE: usize = 40;
+    const DECODE_BASE: usize = 8;
+    let lanes_per_tile = crate::TILE / 64;
+    let drawn = words.len().min(samples.len() * SAMPLE_SIZE);
+    let rows = rank.candidate_tiles()
+        * lanes_per_tile
+        * (drawn * MATERIALISE_LANE + samples.len() * COUNT_LANE);
+    let candidates = rank.candidates.len();
+    let sequence = candidates * index.mean_bases() * DECODE_BASE
+        + samples.len() * candidates.div_ceil(64) * COUNT_LANE;
+    if rows < sequence {
+        Projection::Rows
+    } else {
+        Projection::Sequence
+    }
+}
+
 /// Score every replicate of one strand, exactly or against candidates.
 #[allow(clippy::too_many_arguments)]
 fn score_strand(
@@ -587,6 +649,8 @@ fn score_strand(
     // Hiding only works on the candidate path, so it always takes it.
     let worth_it = ranks_candidates(index, config, hide);
     let mut from_candidates = worth_it;
+    // Whether tie offsets are candidate positions or reference ids.
+    let mut coordinates = Coordinates::References;
     let mut tops = if !worth_it {
         exact_tops(index, words, samples, weights, ws)?
     } else {
@@ -610,11 +674,32 @@ fn score_strand(
         let mut target = config.candidates;
         loop {
             let threshold = ws.rank.select(target);
-            ws.rank.project(index, words, weights)?;
-            let mut tops = Vec::with_capacity(BOOTSTRAPS);
-            for sample in samples {
-                tops.push(ws.rank.replicate(sample));
-            }
+            // Both projections report ties over candidate positions.
+            coordinates = Coordinates::Candidates;
+            let tops = match projection_for(index, config, words, samples, &ws.rank) {
+                Projection::Rows => {
+                    // A candidate matching the whole vocabulary saturates every replicate.
+                    let saturated = ws
+                        .rank
+                        .candidates
+                        .iter()
+                        .any(|&r| usize::from(ws.rank.counts[r as usize]) == words.len());
+                    let (mask, below) = ws.rank.candidate_mask(index.references);
+                    scoring::bitsliced_tops(
+                        index,
+                        words,
+                        samples,
+                        weights,
+                        scoring::Eligible::Candidates { mask, below },
+                        saturated,
+                        &mut ws.engine,
+                    )?
+                }
+                Projection::Sequence | Projection::Auto => {
+                    ws.rank.project(index, words, weights)?;
+                    samples.iter().map(|s| ws.rank.replicate(s)).collect()
+                }
+            };
             // Ties can push the set far past its target, making projection dearer than an exact
             // scan; a threshold no candidate exceeds means the rank pass separated nothing.
             let oversized = ws.rank.candidates.len() * 2 >= index.references;
@@ -635,6 +720,7 @@ fn score_strand(
                     break tops;
                 }
                 from_candidates = false;
+                coordinates = Coordinates::References;
                 break exact_tops(index, words, samples, weights, ws)?;
             }
             target = target.saturating_mul(8).min(ceiling);
@@ -651,10 +737,9 @@ fn score_strand(
         if top.score >= weight::FLOOR {
             let mut ties = rng::stream(key, strand, boot, 1);
             let offset = ties.bounded(top.count as u64) as usize;
-            winners.push(if from_candidates {
-                ws.rank.reference_at(top, offset)
-            } else {
-                top.nth(offset)
+            winners.push(match coordinates {
+                Coordinates::Candidates => ws.rank.reference_at(top, offset),
+                Coordinates::References => top.nth(offset),
             });
         }
     }

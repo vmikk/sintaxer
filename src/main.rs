@@ -99,6 +99,9 @@ enum Command {
         /// Print summed worker-stage timings and first-result latency to stderr.
         #[arg(long)]
         profile: bool,
+        /// Candidate scoring method (same output either way); for benchmarking.
+        #[arg(long, value_enum, default_value_t = classify::Projection::Auto, hide = true)]
+        projection: classify::Projection,
     },
     /// Survey a reference database and report what curation would do to it.
     Curate {
@@ -778,6 +781,7 @@ fn main() -> Result<()> {
             holdout,
             emit_features,
             profile,
+            projection,
         } => {
             run_classify(
                 &reads,
@@ -800,6 +804,7 @@ fn main() -> Result<()> {
                     floor,
                     holdout,
                     emit_features,
+                    projection,
                 },
                 protax_params,
                 profile,

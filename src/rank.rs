@@ -5,7 +5,7 @@
 //! from the top of that ranking. The pruning risk is bounded; see [`Bound`].
 
 use crate::{
-    K, SAMPLE_SIZE, WORDS,
+    K, SAMPLE_SIZE, WORDS, bits,
     index::{Index, Layout, Row},
     scoring::Top,
     weight,
@@ -86,7 +86,20 @@ fn csa_fold(
     input: &[u64],
 ) {
     debug_assert_eq!(occupied[0], 2);
-    let mut level = 0;
+    promote(acc, occupied, carries, lanes, 0, input);
+}
+
+/// The carry-save cascade of [`csa_fold`], from `level` up. `input` is only
+/// read at level zero; above it the carry is taken from `carries`.
+fn promote(
+    acc: &mut [u64],
+    occupied: &mut [u8],
+    carries: &mut [u64],
+    lanes: usize,
+    mut level: usize,
+    input: &[u64],
+) {
+    debug_assert_eq!(occupied[level], 2);
     loop {
         debug_assert!(level + 1 < LEVELS);
         let up = level + 1;
@@ -126,6 +139,82 @@ fn csa_fold(
     }
 }
 
+/// Fold two dense rows' tiles into the accumulator straight from the index,
+/// with one full adder and no copy of either row.
+fn fold_pair(
+    acc: &mut [u64],
+    occupied: &mut [u8],
+    carries: &mut [u64],
+    lanes: usize,
+    x: &[u8],
+    y: &[u8],
+) {
+    if occupied[0] == 2 {
+        // The adder needs at most one bitmap at level zero; halve two first.
+        let (ones, rest) = acc.split_at_mut(LANES);
+        let free = occupied[1] < 2;
+        let (second, above) = rest.split_at_mut(LANES);
+        let out: &mut [u64] = if free {
+            &mut above[occupied[1] as usize * LANES..][..lanes]
+        } else {
+            &mut carries[..lanes]
+        };
+        for ((a, &b), out) in ones[..lanes]
+            .iter_mut()
+            .zip(&second[..lanes])
+            .zip(out.iter_mut())
+        {
+            *out = *a & b;
+            *a ^= b;
+        }
+        occupied[0] = 1;
+        if free {
+            occupied[1] += 1;
+        } else {
+            promote(acc, occupied, carries, lanes, 1, &[]);
+        }
+    }
+    let free = occupied[1] < 2;
+    let (level0, above) = acc.split_at_mut(2 * LANES);
+    let out: &mut [u64] = if free {
+        &mut above[occupied[1] as usize * LANES..][..lanes]
+    } else {
+        &mut carries[..lanes]
+    };
+    let ones = &mut level0[..lanes];
+    let (x, y) = (&x[..lanes * 8], &y[..lanes * 8]);
+    if occupied[0] == 0 {
+        for ((o, (xw, yw)), out) in ones
+            .iter_mut()
+            .zip(x.chunks_exact(8).zip(y.chunks_exact(8)))
+            .zip(out.iter_mut())
+        {
+            let a = u64::from_le_bytes(xw.try_into().expect("eight bytes"));
+            let b = u64::from_le_bytes(yw.try_into().expect("eight bytes"));
+            *o = a ^ b;
+            *out = a & b;
+        }
+    } else {
+        for ((o, (xw, yw)), out) in ones
+            .iter_mut()
+            .zip(x.chunks_exact(8).zip(y.chunks_exact(8)))
+            .zip(out.iter_mut())
+        {
+            let b = u64::from_le_bytes(xw.try_into().expect("eight bytes"));
+            let c = u64::from_le_bytes(yw.try_into().expect("eight bytes"));
+            let ab = *o ^ b;
+            *out = (*o & b) | (ab & c);
+            *o = ab ^ c;
+        }
+    }
+    occupied[0] = 1;
+    if free {
+        occupied[1] += 1;
+    } else {
+        promote(acc, occupied, carries, lanes, 1, &[]);
+    }
+}
+
 /// Transpose an 8x8 bit matrix held in a `u64`: byte `p`, bit `j` becomes byte
 /// `j`, bit `p`, counting bytes from the least significant.
 ///
@@ -160,36 +249,10 @@ fn lane_counts(planes: &[u64], lanes: usize, lane: usize, depth: usize, out: &mu
     }
 }
 
-/// Largest value and the full set of positions holding it.
-///
-/// Walks planes from the most significant bit down, keeping only positions
-/// that have the bit set whenever any do.
-fn plane_max(planes: &[u64], lanes: usize, depth: usize, valid: &[u64]) -> (u32, Vec<u64>) {
-    let mut candidates = valid.to_vec();
-    let mut max = 0u32;
-    for plane in (0..depth).rev() {
-        let base = plane * lanes;
-        let mut any = false;
-        for lane in 0..lanes {
-            if candidates[lane] & planes[base + lane] != 0 {
-                any = true;
-                break;
-            }
-        }
-        if any {
-            for lane in 0..lanes {
-                candidates[lane] &= planes[base + lane];
-            }
-            max |= 1 << plane;
-        }
-    }
-    (max, candidates)
-}
-
 /// Per-worker scratch buffers, reused across queries.
 ///
 /// A few small allocations remain: [`Workspace::rank`] and [`Workspace::rank_batch`]
-/// build per-query row lists, and each `plane_max` call returns a `Vec` owned by [`Top`].
+/// build per-query row lists, and each `replicate` call returns a `Vec` owned by [`Top`].
 pub struct Workspace {
     scratch: Scratch,
     /// Count window for a short final tile, so the blocked kernel always sees a
@@ -205,9 +268,9 @@ pub struct Workspace {
     /// The vocabulary is ascending, so a word's position is this prefix plus the
     /// popcount of lower set bits in its block.
     prefix: Box<[u16; WORDS / 64]>,
+    /// Candidate membership, one row per vocabulary position, [`bits::stride`] lanes wide.
     matrix: Vec<u64>,
     candidate_planes: Vec<u64>,
-    carry: Vec<u64>,
     valid: Vec<u64>,
     /// Exact match count against the whole query vocabulary, per reference.
     pub counts: Vec<u16>,
@@ -221,6 +284,9 @@ pub struct Workspace {
     vocabulary: usize,
     /// References selected for the bootstrap phase, ascending.
     pub candidates: Vec<u32>,
+    /// Candidate bitmap and per-lane prefix counts for [`Workspace::candidate_mask`].
+    mask: Vec<u64>,
+    below: Vec<u32>,
     /// `log2(weight)` per query-vocabulary position, parallel to the words given to `project`.
     shifts: Vec<u8>,
     /// Counter planes needed by the heaviest possible replicate.
@@ -262,6 +328,9 @@ impl Default for Scratch {
 
 /// Fold dense rows' tiles into the carry-save accumulator, continuing from
 /// whatever it already holds.
+///
+/// Rows go through [`fold_pair`] two at a time; an odd row out and rows of a
+/// short final tile are decoded first.
 fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usize) {
     let Scratch {
         tile,
@@ -270,7 +339,7 @@ fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usiz
         carries,
         ..
     } = scratch;
-    for row in rows {
+    let mut single = |row: &Row<'_>, acc: &mut [u64], occupied: &mut [u8], carries: &mut [u64]| {
         if occupied[0] < 2 {
             // Room at level zero: decode straight into the accumulator slot.
             let slot = occupied[0] as usize * LANES;
@@ -280,6 +349,19 @@ fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usiz
             row.dense_tile(start, &mut tile[..lanes]);
             csa_fold(acc, occupied, carries, lanes, &tile[..lanes]);
         }
+    };
+    let mut pending: Option<(&Row<'_>, &[u8])> = None;
+    for row in rows {
+        match row.dense_bytes(start, lanes) {
+            Some(bytes) => match pending.take() {
+                None => pending = Some((row, bytes)),
+                Some((_, first)) => fold_pair(acc, occupied, carries, lanes, first, bytes),
+            },
+            None => single(row, acc, occupied, carries),
+        }
+    }
+    if let Some((row, _)) = pending {
+        single(row, acc, occupied, carries);
     }
 }
 
@@ -598,13 +680,14 @@ impl Default for Workspace {
             prefix: Box::new([0; WORDS / 64]),
             matrix: Vec::new(),
             candidate_planes: Vec::new(),
-            carry: Vec::new(),
             valid: Vec::new(),
             counts: Vec::new(),
             histogram: Vec::new(),
             lane_max: Vec::new(),
             vocabulary: 0,
             candidates: Vec::new(),
+            mask: Vec::new(),
+            below: Vec::new(),
             shifts: Vec::new(),
             depth: depth_for(SAMPLE_SIZE),
         }
@@ -811,9 +894,9 @@ impl Workspace {
         self.depth = depth_for(SAMPLE_SIZE * weights.max() as usize);
         debug_assert!(self.depth <= PLANE_CAP);
 
-        let lanes = self.candidates.len().div_ceil(64).max(1);
+        let stride = bits::stride(self.candidates.len().div_ceil(64).max(1));
         self.matrix.clear();
-        self.matrix.resize(words.len() * lanes, 0);
+        self.matrix.resize(words.len() * stride, 0);
         for (position, &reference) in self.candidates.iter().enumerate() {
             let (lane, bit) = (position / 64, position % 64);
             let (present, prefix, matrix) = (&self.present, &self.prefix, &mut self.matrix);
@@ -825,7 +908,7 @@ impl Workspace {
                 }
                 let position =
                     prefix[block] as usize + (bits & ((1u64 << offset) - 1)).count_ones() as usize;
-                matrix[position * lanes + lane] |= 1 << bit;
+                matrix[position * stride + lane] |= 1 << bit;
             })?;
         }
         Ok(())
@@ -833,22 +916,34 @@ impl Workspace {
 
     /// Exact maximum and complete tie set for one replicate, over candidates.
     ///
-    /// Scores are at most `SAMPLE_SIZE * max weight`. Candidate positions are
-    /// in reference order, so tie draws match the exact path.
+    /// Scores are at most `SAMPLE_SIZE * max weight`; the drawn rows go through
+    /// the counting network in [`crate::bits`]. Candidate positions are in
+    /// reference order, so tie draws match the exact path.
     pub fn replicate(&mut self, sample: &[u16; SAMPLE_SIZE]) -> Top {
         let lanes = self.candidates.len().div_ceil(64).max(1);
+        let stride = bits::stride(lanes);
         let depth = self.depth;
-        self.candidate_planes.clear();
-        self.candidate_planes.resize(depth * lanes, 0);
-        for &position in sample {
-            let row = &self.matrix[position as usize * lanes..][..lanes];
-            let shift = self.shifts[position as usize] as usize;
-            ripple_add_dense(
+        let offsets: [usize; SAMPLE_SIZE] = std::array::from_fn(|i| sample[i] as usize * stride);
+        self.candidate_planes
+            .resize(bits::WEIGHTED_PLANES * stride, 0);
+        if depth > bits::PLANES {
+            let shifts: [u8; SAMPLE_SIZE] =
+                std::array::from_fn(|i| self.shifts[sample[i] as usize]);
+            bits::count_weighted(
+                &self.matrix,
+                &offsets,
+                &shifts,
+                lanes,
+                stride,
                 &mut self.candidate_planes,
-                row,
-                depth,
-                &mut self.carry,
-                shift,
+            );
+        } else {
+            bits::count32(
+                &self.matrix,
+                &offsets,
+                lanes,
+                stride,
+                &mut self.candidate_planes,
             );
         }
         self.valid.clear();
@@ -859,8 +954,50 @@ impl Workspace {
         } else if !used.is_multiple_of(64) {
             self.valid[lanes - 1] = (1u64 << (used % 64)) - 1;
         }
-        let (max, bits) = plane_max(&self.candidate_planes, lanes, depth, &self.valid);
-        Top::from_bits(max as u8, bits)
+        let mut ties = vec![0u64; lanes];
+        let max = bits::masked_max(
+            &self.candidate_planes,
+            stride,
+            depth,
+            lanes,
+            &self.valid,
+            &mut ties,
+        );
+        Top::from_bits(max as u8, ties)
+    }
+
+    /// The candidates as a bitmap over all `n` references, and how many
+    /// precede each lane, for [`crate::scoring::bitsliced_tops`].
+    pub fn candidate_mask(&mut self, n: usize) -> (&[u64], &[u32]) {
+        let lanes = n.div_ceil(64);
+        self.mask.clear();
+        self.mask.resize(lanes, 0);
+        for &reference in &self.candidates {
+            self.mask[reference as usize / 64] |= 1 << (reference % 64);
+        }
+        self.below.clear();
+        self.below.reserve(lanes + 1);
+        let mut total = 0u32;
+        for &word in &self.mask {
+            self.below.push(total);
+            total += word.count_ones();
+        }
+        self.below.push(total);
+        (&self.mask, &self.below)
+    }
+
+    /// How many distinct [`TILE`]s the candidates fall in.
+    pub fn candidate_tiles(&self) -> usize {
+        let mut tiles = 0;
+        let mut last = usize::MAX;
+        for &reference in &self.candidates {
+            let tile = reference as usize / TILE;
+            if tile != last {
+                tiles += 1;
+                last = tile;
+            }
+        }
+        tiles
     }
 
     /// Reference id of the `offset`-th member of a replicate's tie set.

@@ -1,3 +1,12 @@
+## [0.14.0]
+
+### Performance
+- Bootstrap replicates are counted with a bit-sliced carry-save network instead of adding each drawn row in turn. Output is unchanged.
+- `--exact` runs on the same tiled engine and is many times faster, most of all on large databases. The candidate path's exact fallback uses it too.
+- On small and mid-sized databases, candidates are scored in place from the index rows rather than by decoding their sequences. The cheaper method is picked per query.
+- Replicates in which a reference matches every draw are resolved by intersecting rows, and skipped altogether when a candidate holds the whole query vocabulary, as with exact database matches.
+- The rank sweep folds dense rows in pairs straight from the index, and bootstrap sampling is cheaper.
+- Roughly ten times faster overall on databases of tens of thousands of references; million-reference databases gain a few percent.
 
 ## [0.13.0]
 

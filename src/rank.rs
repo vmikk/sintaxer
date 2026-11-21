@@ -1,34 +1,65 @@
-//! Rank pass: one sweep over the whole query vocabulary per query strand.
+//! The rank pass: one whole-vocabulary sweep per query-strand.
 //!
-//! Each reference's match count against the full query vocabulary is computed
-//! once, and bootstrap replicates then run only against a small candidate set
-//! from the top of that ranking. The pruning risk is bounded; see [`Bound`].
+//! SINTAX as published, and both reference implementations, score all N
+//! references once per bootstrap replicate. That is 100 passes over the
+//! database per query-strand, and it is the reason the algorithm is slow --
+//! not the bootstrap, which is cheap, but the loop nest around it.
+//!
+//! This module swaps the nest. Each reference's exact match count against the
+//! *whole* query vocabulary is computed once; the replicates then run against a
+//! small candidate set drawn from the top of that ranking. The expensive pass
+//! happens once instead of a hundred times, and it is the pass that vectorises
+//! best: counters are bit-sliced across references, so one 64-bit operation
+//! advances 64 counters at a time.
+//!
+//! Restricting the replicates to candidates is the one approximation, and it
+//! carries a quantified bound rather than a hope -- see [`Bound`].
 
 use crate::{
     K, SAMPLE_SIZE, WORDS, bits,
-    index::{Index, Layout, Row},
+    index::{Index, Layout, Row, RowRef},
     scoring::Top,
     weight,
 };
 use anyhow::{Result, ensure};
 
-/// Sized so the tile loop's working set (counter planes, carry-save accumulator,
-/// and the tile's slice of `counts`) stays in L1. The index's blocked rows are
-/// cut on the same boundary.
+/// Sized so everything the tile loop touches stays L1-resident: the counter
+/// planes are 11 KiB at the widest (`PLANE_CAP * TILE / 64` u64s), the
+/// carry-save accumulator another 18 KiB, and the tile's slice of `counts` is
+/// 8 KiB. It is also the boundary the index's blocked rows are cut on, which is
+/// why it lives in the crate root.
 pub use crate::TILE;
 const LANES: usize = TILE / 64;
-/// A match count can't exceed the query's vocabulary size, which is capped
-/// just below the word universe, so 17 planes is enough.
+/// A match count cannot exceed the query's vocabulary, which is capped just
+/// below the whole word universe, so seventeen planes always suffice.
 const PLANE_CAP: usize = 17;
 
-/// Vocabularies must stay below this so every position and count fits a `u16`.
+/// Vocabularies must stay below this so every position, and every count, fits
+/// a `u16`.
 const VOCABULARY_CAP: usize = u16::MAX as usize;
 
 /// Add `2^shift` into bit-sliced counters wherever `input` has a bit set.
 ///
-/// Weights are powers of two, so a weight is applied by starting `shift` planes up.
-/// There is no per-lane empty check (inputs are dense), which lets the loop
-/// vectorise; the tile-wide early exit stays.
+/// Written for `depth` planes but it exits as soon as every lane's carry has
+/// died, which for real data is after one or two -- incrementing a counter
+/// ripples only as far as its first zero bit.
+///
+/// `shift` is how an integer weight is applied. Because the weight tiers are
+/// powers of two, adding a weight of four is this same single pass started two
+/// planes up, not four passes: weighting costs nothing per sampled word.
+///
+/// There is deliberately no per-lane `if carry == 0 { continue }` guard. It
+/// only pays on sparse bitmaps, and nothing sparse reaches this function any
+/// more: the rank sweep sends sparse rows down their own kernels, and the
+/// candidate rows the replicates add are dense. The guard was a branch that
+/// was rarely taken and often mispredicted, and LLVM will not speculate the
+/// store behind it, so the guarded loop did not vectorise at any
+/// instruction-set level. Dropping it from the rank kernel was worth -47% of
+/// rank time (docs/RANK_results.md §4.3); dropping it from the replicates too
+/// was -4.8% of all cycles (docs/RANK_round3.md §D).
+///
+/// The tile-wide early exit stays. It is not a per-lane branch and it is worth
+/// keeping: the upper planes stop receiving carries long before `depth`.
 fn ripple_add_dense(
     planes: &mut [u64],
     input: &[u64],
@@ -57,27 +88,39 @@ fn ripple_add_dense(
     }
 }
 
-/// Number of weight levels in the carry-save accumulator.
+/// Number of weight levels the carry-save accumulator can hold.
 ///
-/// Level `L` fills only after `2^L` rows, so `PLANE_CAP` levels are enough.
+/// A level `L` is only ever occupied once `2^L` rows have been folded into it,
+/// so `PLANE_CAP` levels cover every vocabulary the planes themselves can.
 const LEVELS: usize = PLANE_CAP;
 
 /// Fold one dense row's tile bitmap into the carry-save accumulator.
 ///
-/// The accumulator is a binary counter whose digits are bitmaps: level `L` holds
-/// up to two bitmaps of weight `2^L`. A third one triggers a 3:2 compression,
+/// The accumulator is a binary counter whose digits are whole bitmaps: level
+/// `L` holds up to two bitmaps of weight `2^L`. Inserting a third at a level
+/// compresses all three with a 3:2 carry-save adder,
 ///
 /// ```text
 /// sum   = a ^ b ^ c
 /// carry = (a & b) | ((a ^ b) & c)
 /// ```
 ///
-/// keeping `sum` at this level and promoting `carry` one level up. Counts stay
-/// per reference (positional popcount); [`Workspace::rank`] ripples the
-/// survivors into the planes at `shift = level`.
+/// leaving `sum` as the level's only occupant and promoting `carry`, which has
+/// twice the weight, to the level above. That is five boolean operations per
+/// lane and, amortised over a run of rows, about one compression per row --
+/// against a multi-plane carry propagation per row for the direct approach.
+/// Nothing here reads or writes the counter planes, so there is no loop-carried
+/// dependency through them either.
 ///
-/// Only called when level zero is full; otherwise the caller decodes the row
-/// straight into the free slot.
+/// This is *positional* population counting: each reference keeps its own sum.
+/// A textbook Harley-Seal would finish by horizontally popcounting the
+/// compressed words, which would destroy exactly the identity the rank pass
+/// exists to produce; [`Workspace::rank`] ripples the survivors into the planes
+/// at `shift = level` instead.
+///
+/// Only ever called with level zero already full: when it has room the caller
+/// decodes the row straight into the free slot, which is the other half of the
+/// copies this arrangement avoids.
 fn csa_fold(
     acc: &mut [u64],
     occupied: &mut [u8],
@@ -89,8 +132,11 @@ fn csa_fold(
     promote(acc, occupied, carries, lanes, 0, input);
 }
 
-/// The carry-save cascade of [`csa_fold`], from `level` up. `input` is only
-/// read at level zero; above it the carry is taken from `carries`.
+/// The carry-save cascade of [`csa_fold`], from `level` up.
+///
+/// At level zero the incoming value is `input`; above it, it is the carry the
+/// level below left in `carries`, and `input` is not read. `level` must be
+/// full on entry.
 fn promote(
     acc: &mut [u64],
     occupied: &mut [u8],
@@ -103,15 +149,19 @@ fn promote(
     loop {
         debug_assert!(level + 1 < LEVELS);
         let up = level + 1;
-        // Level zero takes the row itself; higher levels take the carry from below.
+        // The incoming value is the row itself at level zero, and above it the
+        // carry the level below just promoted.
         let (below, here) = carries.split_at_mut(level * LANES);
         let c: &[u64] = if level == 0 {
             input
         } else {
             &below[(level - 1) * LANES..][..lanes]
         };
-        // The carry has twice this level's weight, so it moves up one level; write it
-        // straight into a free slot there to avoid a copy.
+        // The carry weighs twice what this level's occupants do, so it belongs
+        // one level up. When that level has room, write it *straight into* the
+        // slot rather than into a scratch buffer that would then be copied
+        // there. Those copies were the largest single source of `memcpy` in the
+        // program; see docs/RANK_results.md.
         let (mine, above) = acc.split_at_mut(up * 2 * LANES);
         let free = occupied[up] < 2;
         let out: &mut [u64] = if free {
@@ -139,8 +189,15 @@ fn promote(
     }
 }
 
-/// Fold two dense rows' tiles into the accumulator straight from the index,
-/// with one full adder and no copy of either row.
+/// Fold two dense rows' tiles into the accumulator straight out of the index:
+/// one full adder against the ones digit, and no copy of either row.
+///
+/// The steady state of [`fold_dense`] used to decode each row before folding
+/// it -- every other row into the free level-zero slot, the rest into a
+/// scratch tile for [`csa_fold`] -- and those two copies were a sixth of all
+/// cycles on a 15k-reference database. Taking the rows two at a time lets the
+/// adder read both where they already are. The carry is promoted exactly as
+/// `csa_fold` promotes it.
 fn fold_pair(
     acc: &mut [u64],
     occupied: &mut [u8],
@@ -150,7 +207,8 @@ fn fold_pair(
     y: &[u8],
 ) {
     if occupied[0] == 2 {
-        // The adder needs at most one bitmap at level zero; halve two first.
+        // Level zero must hold at most one bitmap for the adder below. Two
+        // can only arrive from a restored batch-core state; halve them first.
         let (ones, rest) = acc.split_at_mut(LANES);
         let free = occupied[1] < 2;
         let (second, above) = rest.split_at_mut(LANES);
@@ -182,11 +240,23 @@ fn fold_pair(
         &mut carries[..lanes]
     };
     let ones = &mut level0[..lanes];
-    let (x, y) = (&x[..lanes * 8], &y[..lanes * 8]);
+    // Lanes the rows hold in whole: all of them, except in the database's
+    // final tile, where a row ends inside its last lane. The lanes after
+    // those are read zero-padded: the missing bytes stand for references
+    // that do not exist, whose bits every row holds as zero.
+    let whole = lanes.min(x.len() / 8).min(y.len() / 8);
+    let padded = |row: &[u8], lane: usize| {
+        let mut bytes = [0u8; 8];
+        let tail = row.get(lane * 8..).unwrap_or_default();
+        let n = tail.len().min(8);
+        bytes[..n].copy_from_slice(&tail[..n]);
+        u64::from_le_bytes(bytes)
+    };
+    let (xs, ys) = (&x[..whole * 8], &y[..whole * 8]);
     if occupied[0] == 0 {
         for ((o, (xw, yw)), out) in ones
             .iter_mut()
-            .zip(x.chunks_exact(8).zip(y.chunks_exact(8)))
+            .zip(xs.chunks_exact(8).zip(ys.chunks_exact(8)))
             .zip(out.iter_mut())
         {
             let a = u64::from_le_bytes(xw.try_into().expect("eight bytes"));
@@ -194,10 +264,15 @@ fn fold_pair(
             *o = a ^ b;
             *out = a & b;
         }
+        for lane in whole..lanes {
+            let (a, b) = (padded(x, lane), padded(y, lane));
+            ones[lane] = a ^ b;
+            out[lane] = a & b;
+        }
     } else {
         for ((o, (xw, yw)), out) in ones
             .iter_mut()
-            .zip(x.chunks_exact(8).zip(y.chunks_exact(8)))
+            .zip(xs.chunks_exact(8).zip(ys.chunks_exact(8)))
             .zip(out.iter_mut())
         {
             let b = u64::from_le_bytes(xw.try_into().expect("eight bytes"));
@@ -205,6 +280,13 @@ fn fold_pair(
             let ab = *o ^ b;
             *out = (*o & b) | (ab & c);
             *o = ab ^ c;
+        }
+        for lane in whole..lanes {
+            let (b, c) = (padded(x, lane), padded(y, lane));
+            let o = ones[lane];
+            let ab = o ^ b;
+            out[lane] = (o & b) | (ab & c);
+            ones[lane] = ab ^ c;
         }
     }
     occupied[0] = 1;
@@ -218,7 +300,8 @@ fn fold_pair(
 /// Transpose an 8x8 bit matrix held in a `u64`: byte `p`, bit `j` becomes byte
 /// `j`, bit `p`, counting bytes from the least significant.
 ///
-/// Three delta swaps (Hacker's Delight 7-3), branch-free.
+/// Three delta swaps (Hacker's Delight 7-3). Eighteen instructions, no branches
+/// and no memory traffic.
 fn transpose8(mut x: u64) -> u64 {
     let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
     x ^= t ^ (t << 7);
@@ -231,10 +314,20 @@ fn transpose8(mut x: u64) -> u64 {
 
 /// Write one lane's 64 finished counts, reassembled from the counter planes.
 ///
-/// Byte `g` of each of the low eight planes forms an 8x8 bit matrix (rows are
-/// planes, columns are references `8g..8g+8`); transposing it yields each
-/// reference's count as a byte. `out` must be exactly 64 wide; planes at or
-/// above eight are handled by the caller.
+/// The planes hold each reference's count transposed across bit positions; this
+/// puts it back together. Byte `g` of each of the low eight planes forms an 8x8
+/// bit matrix whose rows are planes and whose columns are the eight references
+/// `8g..8g+8`, so transposing it turns every column into a byte -- that
+/// reference's count, finished, in one write.
+///
+/// The previous implementation iterated the set bits and OR-ed each into
+/// `counts`: with a mean dense count in the forties that is roughly 5M scattered
+/// `u16` read-modify-writes per query-strand, and it required `counts` to be
+/// zeroed first. Writing every count exactly once is both cheaper and what lets
+/// the per-tile clear go away.
+///
+/// `out` must be exactly 64 wide. Planes at or above eight are not represented
+/// here -- see the caller.
 fn lane_counts(planes: &[u64], lanes: usize, lane: usize, depth: usize, out: &mut [u16]) {
     debug_assert_eq!(out.len(), 64);
     let mut rows = [[0u8; 8]; 8];
@@ -249,26 +342,43 @@ fn lane_counts(planes: &[u64], lanes: usize, lane: usize, depth: usize, out: &mu
     }
 }
 
-/// Per-worker scratch buffers, reused across queries.
+/// Per-worker scratch, reused across queries.
 ///
-/// A few small allocations remain: [`Workspace::rank`] and [`Workspace::rank_batch`]
-/// build per-query row lists, and each `replicate` call returns a `Vec` owned by [`Top`].
+/// Neither path is strictly allocation-free, and both allocations are recorded
+/// here rather than removed because a mimalloc A/B moved nothing (0.01%):
+///
+/// - [`Workspace::rank`] and [`Workspace::rank_batch`] build each query's rows,
+///   dense words and cursors per call, to partition the vocabulary by
+///   representation. A handful of allocations per query-strand against tens
+///   of milliseconds of sweeping.
+/// - [`Workspace::replicate`] returns a fresh tie mask per call, which [`Top`]
+///   then owns, and a strand keeps all `BOOTSTRAPS` of them alive at once --
+///   roughly 200 allocations of `lanes * 8` bytes per query.
 pub struct Workspace {
     scratch: Scratch,
-    /// Count window for a short final tile, so the blocked kernel always sees a
-    /// whole tile (see [`Row::block_increment`]).
+    /// Count window for the final tile when it is short, so the blocked kernel
+    /// always sees a whole tile (see [`Row::block_increment`]).
     short: Box<[u16; TILE]>,
     /// Rankings computed ahead by [`Workspace::rank_batch`], waiting to be
     /// [adopted](Workspace::adopt).
     batch: Vec<Ranking>,
-    /// The query vocabulary as a bitmap over the whole word universe (8 KiB, fits L1).
-    present: Box<[u64; WORDS / 64]>,
-    /// Number of vocabulary words below each 64-word block of `present`.
+    /// The query vocabulary as a bitmap over the whole word universe.
     ///
-    /// The vocabulary is ascending, so a word's position is this prefix plus the
-    /// popcount of lower set bits in its block.
+    /// Projection probes it once per k-mer of every candidate, so it has to
+    /// answer out of L1: 8 KiB.
+    present: Box<[u64; WORDS / 64]>,
+    /// Words of the vocabulary below each 64-word block of `present`.
+    ///
+    /// Because the vocabulary is ascending, a word's position in it is its rank
+    /// among the set bits of `present`: this prefix plus a popcount of the bits
+    /// below it within its block. That replaces a 128 KiB word-to-position table
+    /// which lived in L2 and had to be reset word by word on every call. 2 KiB,
+    /// and nothing to reset; measured about 2% of cycles, within noise
+    /// (docs/RANK_round2.md §3.3).
     prefix: Box<[u16; WORDS / 64]>,
-    /// Candidate membership, one row per vocabulary position, [`bits::stride`] lanes wide.
+    /// Word-major candidate membership: one row per vocabulary position,
+    /// [`bits::stride`] lanes wide so the counting network can read whole
+    /// chunks, padding lanes zero.
     matrix: Vec<u64>,
     candidate_planes: Vec<u64>,
     valid: Vec<u64>,
@@ -276,25 +386,35 @@ pub struct Workspace {
     pub counts: Vec<u16>,
     /// Scratch for [`Workspace::select`]'s partial histogram.
     histogram: Vec<u32>,
-    /// Largest count in each run of 64 references. [`Workspace::select`] uses it to
-    /// bound the threshold and to skip runs with no candidate, so it must be exact;
-    /// [`Workspace::exclude`] recomputes any run it lowers.
+    /// Largest count in each run of 64 references, recorded while the tile is
+    /// still in L1. [`Workspace::select`] uses it twice: to bound the
+    /// threshold from below without a histogram of all `N` counts, and to skip
+    /// every run that holds no candidate. Both uses need it to be the exact
+    /// maximum, so [`Workspace::exclude`] recomputes the runs it lowers.
     lane_max: Vec<u16>,
-    /// Vocabulary size the counts were taken against, i.e. the largest possible count.
+    /// Size of the vocabulary the counts were taken against: the largest count
+    /// possible, and the top of the histogram [`Workspace::select`] walks.
     vocabulary: usize,
+    /// The rows of that vocabulary, in its order; see [`Workspace::row_refs`].
+    refs: Vec<RowRef>,
     /// References selected for the bootstrap phase, ascending.
     pub candidates: Vec<u32>,
-    /// Candidate bitmap and per-lane prefix counts for [`Workspace::candidate_mask`].
+    /// [`Workspace::candidate_mask`]'s bitmap, one bit per reference, and the
+    /// candidates below each of its lanes.
     mask: Vec<u64>,
     below: Vec<u32>,
-    /// `log2(weight)` per query-vocabulary position, parallel to the words given to `project`.
+    /// `log2(weight)` per query-vocabulary position, parallel to the words
+    /// `project` was given. `replicate` samples positions, so this is indexed
+    /// by exactly what that loop already holds: a small contiguous array, no
+    /// new cache pressure on the hot path.
     shifts: Vec<u8>,
-    /// Counter planes needed by the heaviest possible replicate.
+    /// Counter planes the heaviest possible replicate needs.
     depth: usize,
 }
 
-/// Tile-loop scratch, sized for one tile of one query so it stays in L1;
-/// queries in a batch take turns with it tile by tile.
+/// What the tile loop reuses for every query-tile it sweeps. Sized for one
+/// tile of one query, so it stays L1-resident however many queries share a
+/// sweep: queries take turns with it tile by tile.
 struct Scratch {
     planes: Vec<u64>,
     tile: Vec<u64>,
@@ -305,10 +425,16 @@ struct Scratch {
     /// One carry bitmap per level, produced by [`csa_fold`].
     carries: Vec<u64>,
     carry: Vec<u64>,
-    /// Accumulator state (and occupancy) after folding a batch's shared dense rows;
-    /// every query in the batch starts its tile from here.
+    /// The accumulator as it stood after folding a batch's common dense rows,
+    /// and its occupancy: the state every query of the batch starts its tile
+    /// from.
     core_acc: Vec<u64>,
     core_occupied: Vec<u8>,
+    /// The tile's blocked postings, gathered into one run so they are counted
+    /// by one loop rather than one short loop per row; see [`count_blocks`].
+    stream: Box<[u8; STREAM]>,
+    /// Which blocks are gathered into `stream`.
+    staging: Staging,
 }
 
 impl Default for Scratch {
@@ -322,15 +448,112 @@ impl Default for Scratch {
             carry: Vec::new(),
             core_acc: vec![0; LEVELS * 2 * LANES],
             core_occupied: vec![0; LEVELS],
+            stream: Box::new([0; STREAM]),
+            staging: Staging::default(),
         }
     }
+}
+
+/// Bytes of blocked postings gathered before one counting pass: 4,096
+/// postings. Small enough to share L1 with the 8 KiB count window and the
+/// accumulator even when two SMT threads share the core.
+const STREAM: usize = 8 * 1024;
+
+/// Which of a tile's blocks [`count_blocks`] gathers into one counting pass.
+///
+/// Both give the same counts; they trade differently. Gathering a block
+/// saves its own loop -- a mispredicted exit and some bookkeeping -- at the
+/// price of copying its postings once. With one worker per physical core
+/// that pays for every block: on EUKARYOME it is 6.8% of all cycles at one
+/// thread and 5.5% at four. When two workers share a core, the SMT sibling
+/// already hides those exits, and copying the long blocks is then simply
+/// more work: gathering everything costs 4.6% at eight threads on 4C/8T,
+/// where gathering only the short blocks is neutral and still saves 4.6%
+/// at one thread (docs/Optimization_round_6.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Staging {
+    /// Only blocks of up to 32 postings, one fixed-size move each. Safe
+    /// whatever shares the core.
+    #[default]
+    Short,
+    /// Every block but the largest, in 128-byte moves. Best when each worker
+    /// has a physical core to itself.
+    All,
+}
+
+/// Add one to `window[local]` for every posting of this tile's blocked rows.
+///
+/// Counting each row's block in its own loop costs a mispredicted loop exit
+/// and some bookkeeping per row-tile, and most blocks are short: on
+/// EUKARYOME a mean of 46 postings, and 39% of a query's blocked rows
+/// average fewer than 25 a tile (docs/Profiling_14_260926.md §3). This is the
+/// short-row problem of sparse matrix-vector products, and the answer here is
+/// theirs: decouple the loop from row boundaries. Blocks of up to `LIMIT`
+/// bytes are copied back to back into `stream`, and one loop counts the lot;
+/// a longer block amortises its own loop and is counted straight from the
+/// row. See [`Staging`] for the two limits used.
+///
+/// Each block is copied in fixed `COPY`-byte moves, so a block of up to
+/// `COPY` bytes costs one constant-size copy and no length-dependent branch.
+/// A move may run past its block, into the rest of the same row, and those
+/// bytes land where the next block's copy overwrites them, or past the end
+/// of what is counted. Only `stream[..pos]`, the blocks' own postings, is
+/// ever counted, so the increments are exactly the ones the rows hold, and
+/// addition commutes. A move never reads past the row: where fewer than
+/// `COPY` bytes of it remain, the rest of the block is copied exactly.
+///
+/// `spans` holds, per row, the row from its block onwards and the block's
+/// length in bytes.
+fn count_blocks<const COPY: usize, const LIMIT: usize>(
+    spans: &[(&[u8], usize)],
+    stream: &mut [u8; STREAM],
+    window: &mut [u16; TILE],
+) {
+    const { assert!(LIMIT + COPY <= STREAM) };
+    let mut pos = 0;
+    for &(tail, bytes) in spans {
+        if bytes > LIMIT {
+            Row::block_increment(&tail[..bytes], window);
+            continue;
+        }
+        if pos + bytes + COPY > STREAM {
+            Row::block_increment(&stream[..pos], window);
+            pos = 0;
+        }
+        let mut done = 0;
+        loop {
+            match tail.get(done..done + COPY) {
+                Some(chunk) => {
+                    let chunk: &[u8; COPY] = chunk.try_into().expect("a COPY-byte chunk");
+                    let out: &mut [u8; COPY] = (&mut stream[pos + done..pos + done + COPY])
+                        .try_into()
+                        .expect("a COPY-byte chunk");
+                    *out = *chunk;
+                }
+                None => {
+                    stream[pos + done..pos + bytes].copy_from_slice(&tail[done..bytes]);
+                    break;
+                }
+            }
+            done += COPY;
+            if done >= bytes {
+                break;
+            }
+        }
+        pos += bytes;
+    }
+    Row::block_increment(&stream[..pos], window);
 }
 
 /// Fold dense rows' tiles into the carry-save accumulator, continuing from
 /// whatever it already holds.
 ///
-/// Rows go through [`fold_pair`] two at a time; an odd row out and rows of a
-/// short final tile are decoded first.
+/// Rows are taken two at a time straight from the index through
+/// [`fold_pair`], the database's short final tile included: its last lane is
+/// read zero-padded. Only an odd row out goes the old way: decoded into the
+/// free level-zero slot, or into the scratch tile and then through
+/// [`csa_fold`]. On a four-tile database the final tile used to send every
+/// row that way: about a quarter of all folding cycles on ncbi_16s.
 fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usize) {
     let Scratch {
         tile,
@@ -341,7 +564,8 @@ fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usiz
     } = scratch;
     let mut single = |row: &Row<'_>, acc: &mut [u64], occupied: &mut [u8], carries: &mut [u64]| {
         if occupied[0] < 2 {
-            // Room at level zero: decode straight into the accumulator slot.
+            // Room at the bottom: decode into the accumulator slot
+            // itself and skip the scratch tile entirely.
             let slot = occupied[0] as usize * LANES;
             row.dense_tile(start, &mut acc[slot..slot + lanes]);
             occupied[0] += 1;
@@ -352,12 +576,10 @@ fn fold_dense(scratch: &mut Scratch, rows: &[Row<'_>], start: usize, lanes: usiz
     };
     let mut pending: Option<(&Row<'_>, &[u8])> = None;
     for row in rows {
-        match row.dense_bytes(start, lanes) {
-            Some(bytes) => match pending.take() {
-                None => pending = Some((row, bytes)),
-                Some((_, first)) => fold_pair(acc, occupied, carries, lanes, first, bytes),
-            },
-            None => single(row, acc, occupied, carries),
+        let bytes = row.dense_bytes_upto(start, lanes);
+        match pending.take() {
+            None => pending = Some((row, bytes)),
+            Some((_, first)) => fold_pair(acc, occupied, carries, lanes, first, bytes),
         }
     }
     if let Some((row, _)) = pending {
@@ -382,43 +604,55 @@ fn copy_acc(
     }
 }
 
-/// One query's whole-vocabulary ranking, left by [`Workspace::rank_batch`]
-/// for [`Workspace::adopt`].
+/// One query's whole-vocabulary ranking, as [`Workspace::rank_batch`] leaves
+/// it for [`Workspace::adopt`].
 #[derive(Default)]
 struct Ranking {
     counts: Vec<u16>,
     lane_max: Vec<u16>,
+    refs: Vec<RowRef>,
     vocabulary: usize,
-    /// Not yet adopted. Adopting swaps the arrays out, so each slot is adopted once.
+    /// Not yet adopted. Adopting swaps the arrays out, so a second adoption
+    /// would hand over whatever the previous query left behind.
     fresh: bool,
 }
 
 /// One query's rows and cursors, carried from tile to tile of a sweep.
 struct Sweep<'a> {
-    /// Grouped by storage (bitmap, blocked, plain postings) so each kernel sees one
-    /// contiguous slice; order within a group doesn't matter.
+    /// Grouped by storage so each kernel sees one contiguous slice: bitmap
+    /// rows, then blocked, then plain postings. Within a group the order is
+    /// irrelevant: addition commutes, and every row outside the bitmap group
+    /// carries its own cursor.
     rows: Vec<Row<'a>>,
     /// The words of the bitmap rows, parallel to them and ascending.
     dense_words: Vec<u16>,
     dense: usize,
-    /// Leading bitmap rows shared by the whole batch, folded once per tile for all queries.
+    /// Leading bitmap rows the whole batch shares, folded once per tile for
+    /// all of it rather than once per query.
     core: usize,
     blocked: usize,
     /// Counter planes the dense rows need.
     depth: usize,
-    /// Byte offsets into the blocked rows, then posting offsets into the plain ones.
+    /// Byte offsets into the blocked rows, then posting offsets into the plain.
     cursors: Vec<usize>,
+    /// Every word's row, in vocabulary order, for the replicates to reuse.
+    refs: Vec<RowRef>,
 }
 
 impl<'a> Sweep<'a> {
     fn new(index: &'a Index, words: &[u16]) -> Result<Self> {
         ensure!(!words.is_empty(), "empty query vocabulary");
         ensure!(words.len() < VOCABULARY_CAP, "query vocabulary too large");
+        let refs: Vec<RowRef> = words
+            .iter()
+            .map(|&word| index.locate(word))
+            .collect::<Result<_>>()?;
         let mut rows: Vec<(u16, Row<'a>)> = words
             .iter()
-            .map(|&word| Ok((word, index.row(word)?)))
-            .collect::<Result<_>>()?;
-        // Stable sort, so each group stays in word order.
+            .zip(&refs)
+            .map(|(&word, &at)| (word, index.row_at(at)))
+            .collect();
+        // Stable, so each group stays in word order.
         rows.sort_by_key(|(_, row)| match row.layout {
             Layout::Bitmap => 0u8,
             Layout::Blocked => 1,
@@ -440,6 +674,7 @@ impl<'a> Sweep<'a> {
             blocked,
             depth,
             cursors,
+            refs,
         })
     }
 }
@@ -456,12 +691,12 @@ fn sweep<'a>(
 ) {
     let core = share_core(queries);
     let widest = queries.iter().map(|q| q.blocked).max().unwrap_or(0);
-    let mut spans: Vec<&'a [u8]> = Vec::with_capacity(widest);
+    let mut spans: Vec<(&'a [u8], usize)> = Vec::with_capacity(widest);
     let mut start = 0;
     while start < n {
         let width = (n - start).min(TILE);
         if core > 0 {
-            // Fold the rows shared by every query once.
+            // The rows every query holds, folded once for all of them.
             let lanes = width.div_ceil(64);
             scratch.occupied.fill(0);
             fold_dense(scratch, &queries[0].rows[..core], start, lanes);
@@ -476,8 +711,9 @@ fn sweep<'a>(
         }
         for (i, (query, (all, lane_max))) in queries.iter_mut().zip(targets.iter_mut()).enumerate()
         {
-            // Only the final tile can be short; it is built in a scratch window and
-            // copied out. Anything past `width` there is never read.
+            // Only the final tile can be short. It is assembled in a scratch
+            // window and copied out at the end; what lies past `width` there
+            // is never read.
             let window: &mut [u16; TILE] = if width == TILE {
                 (&mut all[start..start + TILE])
                     .try_into()
@@ -485,10 +721,11 @@ fn sweep<'a>(
             } else {
                 short
             };
-            // The first query finds the core state still in the accumulator; the rest
-            // restore it from the copy.
+            // The first query finds the core's state still in the
+            // accumulator; the rest start from the copy.
             sweep_tile(scratch, query, &mut spans, start, width, window, i > 0);
-            // Record run maxima while the tile is still in L1.
+            // The tile is complete and still in L1; its run maxima cost one
+            // vectorised pass over 8 KiB here instead of a cold pass later.
             for (max, lane) in lane_max[start / 64..]
                 .iter_mut()
                 .zip(window[..width].chunks(64))
@@ -503,14 +740,16 @@ fn sweep<'a>(
     }
 }
 
-/// Batches sharing fewer dense rows than this are swept per query; the
-/// snapshot/restore would cost more than the shared folds save.
+/// Queries of a batch with fewer common dense rows than this are swept
+/// independently: a snapshot and a restore per query-tile cost more than a
+/// handful of shared folds save.
 const MIN_CORE: usize = 8;
 
-/// Find the dense rows every query in a batch holds and move them to the front
-/// of each query's dense rows, in the same order. Returns how many.
+/// Find the dense rows every query of a batch holds, and move them to the
+/// front of each query's dense rows in the same order. Returns how many.
 ///
-/// Counts are unaffected, since fold order doesn't change a sum.
+/// Counts are unaffected: the fold order of a sum does not matter, and each
+/// query still folds every one of its own rows.
 fn share_core(queries: &mut [Sweep<'_>]) -> usize {
     let [first, rest @ ..] = queries else {
         return 0;
@@ -543,15 +782,17 @@ fn share_core(queries: &mut [Sweep<'_>]) -> usize {
     core.len()
 }
 
-/// Counts of one query for references `start .. start + width`, into
+/// Counts of one query for the references `start .. start + width`, into
 /// `window[..width]`.
 ///
-/// With a batch core (`query.core > 0`) it starts from the core's accumulator
-/// state: from `scratch.core_acc` if `restore` is set, else from `scratch.acc`.
+/// A query with a batch core (`query.core > 0`) starts from the core's
+/// accumulator state instead of an empty one: from the copy in
+/// `scratch.core_acc` when `restore` is set, and otherwise from `scratch.acc`
+/// as [`sweep`] left it.
 fn sweep_tile<'a>(
     scratch: &mut Scratch,
     query: &mut Sweep<'a>,
-    spans: &mut Vec<&'a [u8]>,
+    spans: &mut Vec<(&'a [u8], usize)>,
     start: usize,
     width: usize,
     window: &mut [u16; TILE],
@@ -582,13 +823,17 @@ fn sweep_tile<'a>(
         acc,
         occupied,
         carry,
+        stream,
+        staging,
         ..
     } = scratch;
     let counts = &mut window[..width];
     if depth > 0 {
         let planes = &mut planes[..depth * lanes];
         planes.fill(0);
-        // Only the survivors (at most two bitmaps per level) reach the planes.
+        // Only the survivors reach the planes: at most two bitmaps per
+        // weight level, so a couple of dozen ripples for a tile instead
+        // of one per dense row.
         for (level, &slots) in occupied.iter().enumerate() {
             debug_assert!(slots == 0 || level < depth);
             for slot in 0..slots as usize {
@@ -596,7 +841,8 @@ fn sweep_tile<'a>(
                 ripple_add_dense(planes, &acc[at..at + lanes], depth, carry, level);
             }
         }
-        // Every count in the window is written here, so it isn't cleared first.
+        // Every count in the window is written here, which is why the
+        // window is not cleared first.
         for lane in 0..lanes {
             let base = lane * 64;
             if base + 64 <= width {
@@ -607,9 +853,11 @@ fn sweep_tile<'a>(
                 counts[base..width].copy_from_slice(&tail[..width - base]);
             }
         }
-        // The byte transpose covers only eight planes; counts above 255 need the
-        // higher planes added bit by bit. Still exact, since the transpose wrote
-        // those bits as zero.
+        // A byte-wide transpose carries eight planes, so a count above
+        // 255 has bits it cannot reach. That needs more than 255 dense
+        // rows in one query's vocabulary -- around 190 is typical -- so
+        // the planes above eight keep the old set-bit scatter. It stays
+        // exact: the transpose has already written those bits as zero.
         if depth > 8 {
             for lane in 0..lanes {
                 let base = lane * 64;
@@ -628,13 +876,23 @@ fn sweep_tile<'a>(
             }
         }
     } else {
-        // An all-sparse vocabulary writes nothing above, so zero the window first.
+        // An all-sparse vocabulary assigns nothing, so it still needs a
+        // zeroed window to increment into.
         counts.fill(0);
     }
 
-    // Blocked rows are read in tile order, so their cursors are byte offsets that
-    // only move forward. Block lengths are read first in a separate pass so the
-    // loads overlap and prefetch each block's first line.
+    // Blocked rows are read strictly in tile order -- that is the
+    // whole point of the layout -- so their cursors are byte offsets
+    // that only ever move forward, and nothing is compared per posting.
+    //
+    // Every row's block length is read first, in a pass of its own.
+    // Those loads are independent of each other, so they overlap
+    // instead of each one waiting behind the previous row's postings;
+    // they also pull each block's first line into L1 before it is
+    // copied. The blocks are then counted together, see [`count_blocks`].
+    // The pass used to touch each block's last byte as well, to put a
+    // block's second line in flight early; the copies now read every
+    // line straight after, and the touch measured 3.5% slower.
     let (blocked_cursors, plain_cursors) = query.cursors.split_at_mut(blocked.len());
     spans.clear();
     spans.extend(
@@ -646,13 +904,12 @@ fn sweep_tile<'a>(
                 let block = u16::from_le_bytes([data[*cursor], data[*cursor + 1]]) as usize;
                 let at = *cursor + 2;
                 *cursor = at + block * 2;
-                // Touch the last byte too, so a block spanning two cache lines loads both.
-                std::hint::black_box(data[*cursor - 1]);
-                &data[at..*cursor]
+                (&data[at..], block * 2)
             }),
     );
-    for postings in spans.iter() {
-        Row::block_increment(postings, window);
+    match staging {
+        Staging::Short => count_blocks::<64, 64>(spans, stream, window),
+        Staging::All => count_blocks::<128, { STREAM / 2 }>(spans, stream, window),
     }
     let counts = &mut window[..width];
     for (row, cursor) in plain.iter().zip(plain_cursors.iter_mut()) {
@@ -661,7 +918,7 @@ fn sweep_tile<'a>(
 }
 
 /// Size a count array and its run maxima for `n` references. Every tile
-/// writes its whole window, so zeroing is only needed on resize.
+/// assigns its whole window, so zeroing is only needed on a resize.
 fn size_for(counts: &mut Vec<u16>, lane_max: &mut Vec<u16>, n: usize) {
     if counts.len() != n {
         counts.clear();
@@ -685,6 +942,7 @@ impl Default for Workspace {
             histogram: Vec::new(),
             lane_max: Vec::new(),
             vocabulary: 0,
+            refs: Vec::new(),
             candidates: Vec::new(),
             mask: Vec::new(),
             below: Vec::new(),
@@ -699,12 +957,37 @@ fn depth_for(vocabulary: usize) -> usize {
 }
 
 impl Workspace {
+    /// Choose which blocked postings the sweep gathers before counting; see
+    /// [`Staging`]. Counts are identical either way.
+    pub fn set_staging(&mut self, staging: Staging) {
+        self.scratch.staging = staging;
+    }
+
     /// Exact `|W(query) intersect W(r)|` for every reference `r`.
     ///
-    /// The sweep is tiled so the counter planes stay in L1. Dense (bitmap) rows go
-    /// through the bit-sliced adder; sparse (posting list) rows increment `counts`
-    /// directly. Each tile's counts and run maxima are written while still hot;
-    /// no full histogram is built, since [`Workspace::select`] only needs the upper tail.
+    /// The sweep is tiled so the counter planes stay L1-resident, and each row
+    /// representation gets the kernel it is actually suited to.
+    ///
+    /// **Dense rows** -- bitmaps, one bit per reference -- go through the
+    /// bit-sliced adder, where one 64-bit AND/XOR advances 64 counters at once.
+    /// They are only 35% of a typical query's vocabulary but 61% of its bytes.
+    ///
+    /// **Sparse rows** -- sorted posting lists -- increment `counts` directly.
+    /// Building a 64-lane bitmap out of forty-odd postings and then rippling it
+    /// through ten planes costs far more than forty-odd `+= 1`s into a window
+    /// that is already in L1. This is the single largest structural change to
+    /// the sweep: it removes roughly two thirds of all `ripple_add` calls.
+    ///
+    /// Because the planes now carry only the dense contribution, `depth` is set
+    /// by the number of dense rows rather than by the whole vocabulary -- about
+    /// eight planes instead of ten on a production query -- and the final `u16`
+    /// count holds the combined total.
+    ///
+    /// The tile's count window is filled and its per-run maxima recorded while
+    /// it is still hot, which is what lets the whole-array memset go away.
+    /// There is deliberately no histogram of all `N` counts: [`Workspace::select`]
+    /// needs only its upper tail, and builds that from the runs `lane_max`
+    /// admits (docs/RANK_round3.md §A).
     pub fn rank(&mut self, index: &Index, words: &[u16]) -> Result<()> {
         let mut query = Sweep::new(index, words)?;
         let n = index.references;
@@ -717,15 +1000,20 @@ impl Workspace {
             std::slice::from_mut(&mut query),
             &mut [(&mut self.counts[..], &mut self.lane_max[..])],
         );
+        self.refs = query.refs;
         Ok(())
     }
 
     /// [`Workspace::rank`] for several queries in one sweep, each left waiting
     /// for [`Workspace::adopt`].
     ///
-    /// Tiles are the outer loop and queries the inner one, using the same kernels,
-    /// so counts are identical. Queries share most dense rows, so a shared tile
-    /// is fetched from memory once and reused from cache.
+    /// The tile loop is turned inside out: tiles outside, queries inside, each
+    /// query sweeping a tile with exactly the kernels a lone query would use.
+    /// Every count is therefore the same. What changes is where the bytes come
+    /// from. The dense rows are the most common words, so a batch's queries
+    /// share most of them, and a tile of a shared row is fetched from DRAM by
+    /// the first query that needs it and found in L2 by the rest
+    /// (docs/RANK_round3.md §E).
     pub fn rank_batch(&mut self, index: &Index, queries: &[&[u16]]) -> Result<()> {
         let mut sweeps = queries
             .iter()
@@ -749,27 +1037,49 @@ impl Workspace {
             &mut sweeps,
             &mut targets,
         );
+        for (ranking, sweep) in self.batch.iter_mut().zip(sweeps) {
+            ranking.refs = sweep.refs;
+        }
         Ok(())
     }
 
-    /// Make the `slot`-th query of the last [`Workspace::rank_batch`] current, as if
-    /// [`Workspace::rank`] had just swept it. Arrays are swapped, not copied, so
-    /// each slot can be adopted once.
+    /// Make the `slot`-th query of the last [`Workspace::rank_batch`] the one
+    /// `select`, `exclude`, `project` and `counts` refer to, exactly as if
+    /// [`Workspace::rank`] had just swept it. Constant time: the arrays are
+    /// swapped, not copied, so each slot can be adopted once.
     pub fn adopt(&mut self, slot: usize) {
         let ranking = &mut self.batch[slot];
         assert!(ranking.fresh, "ranking {slot} was already adopted");
         ranking.fresh = false;
         std::mem::swap(&mut self.counts, &mut ranking.counts);
         std::mem::swap(&mut self.lane_max, &mut ranking.lane_max);
+        std::mem::swap(&mut self.refs, &mut ranking.refs);
         self.vocabulary = ranking.vocabulary;
+    }
+
+    /// Where each word of the vocabulary last ranked has its row, in that
+    /// vocabulary's order: the sweep's own directory reads, kept so the
+    /// replicates that follow it need none (see [`crate::index::RowRef`]).
+    pub fn row_refs(&self) -> &[RowRef] {
+        &self.refs
     }
 
     /// Erase references the caller rejects, as if they were never indexed.
     ///
-    /// Used in training to hide the query's own sequence, genus or family from the
-    /// database without rebuilding it. A zeroed count can never be selected, so
-    /// that is enough; `lane_max` is recomputed for affected runs.
-    /// The predicate gets the count as well as the id to avoid borrowing `self`.
+    /// Training needs the database to *not* contain the query's own sequence,
+    /// or its whole genus, or its whole family, so that a fitted coefficient
+    /// learns what a query with no close relative looks like. PROTAX does this
+    /// with a per-query `seq_dont_use` list rather than by rebuilding the
+    /// database, which is what lets one pass over the production index stand
+    /// in for every state of database completeness.
+    ///
+    /// Zeroing the count is enough to erase a reference from everything
+    /// downstream: `select` admits nothing below a threshold of one, so a
+    /// zeroed reference cannot become a candidate, cannot be projected, and
+    /// cannot win a replicate. `lane_max` is recomputed for every run that lost
+    /// a count, because `select` reads it as an exact maximum.
+    /// The predicate is handed the count as well as the id so it can be
+    /// written without borrowing the workspace it is erasing from.
     pub fn exclude(&mut self, mut rejected: impl FnMut(usize, u16) -> bool) -> usize {
         let mut erased = 0;
         for (lane, (counts, max)) in self
@@ -792,8 +1102,12 @@ impl Workspace {
         erased
     }
 
-    /// `histogram[v]` is the number of references whose count is `v`, over the whole
-    /// vocabulary range. A full pass over all counts; only `--risk` needs it.
+    /// `histogram[v]` is the number of references whose count is `v`, over
+    /// the whole vocabulary range.
+    ///
+    /// A full cold pass over all `N` counts. Only the opt-in `--risk` bound
+    /// needs the lower part of the distribution; [`Workspace::select`] builds
+    /// just the upper tail it needs.
     pub fn histogram(&self) -> Vec<u32> {
         let mut histogram = vec![0u32; self.vocabulary + 1];
         for &count in &self.counts {
@@ -803,14 +1117,21 @@ impl Workspace {
     }
 
     /// Smallest threshold whose `{r : count(r) >= threshold}` holds at least
-    /// `target` references, and that set in ascending order.
+    /// `target` references, and that set in ascending reference order.
     ///
-    /// Ties at the threshold are never cut, so no tied reference is favoured.
-    /// The largest `t_low` at which `target` runs have maximum >= `t_low` bounds
-    /// the threshold from below, so only those runs need an exact histogram.
+    /// Ties at the threshold are never truncated: a candidate set that cuts
+    /// through a group of equally-ranked references would bias which of them
+    /// can win a replicate.
+    ///
+    /// The threshold is found without histogramming all `N` counts. A run of
+    /// 64 references whose maximum is at least `t` holds at least one
+    /// reference counting at least `t`, so the largest `t_low` at which
+    /// `target` runs qualify is a lower bound on the threshold. Only the runs
+    /// at or above `t_low` -- about `target` of them -- can hold a count that
+    /// matters, and the exact histogram of those decides the threshold.
     pub fn select(&mut self, target: usize) -> u16 {
         let top = self.vocabulary;
-        // Histogram runs by their maximum (never above the vocabulary size).
+        // Runs by their maximum. `lane_max` never exceeds the vocabulary.
         self.histogram.clear();
         self.histogram.resize(top + 1, 0);
         for &max in &self.lane_max {
@@ -825,10 +1146,11 @@ impl Workspace {
             }
             low -= 1;
         }
-        // Count 0 means no shared words; such a reference can never win.
+        // Count 0 means no shared words at all; such a reference can never win.
         let low = low.max(1);
 
-        // Exact histogram of counts at or above the bound, from runs that can hold one.
+        // Exact histogram of the counts at or above the bound, from the runs
+        // that can hold one.
         self.histogram.clear();
         self.histogram.resize(top + 1 - low, 0);
         for (&max, counts) in self.lane_max.iter().zip(self.counts.chunks(64)) {
@@ -841,7 +1163,9 @@ impl Workspace {
                 }
             }
         }
-        // Same descent as over a full histogram; it can't stop below `low`.
+        // The same descent a full histogram would make. If `target` runs
+        // qualified at `low` it stops at or above it; if not, it would have
+        // run down to zero and been lifted back to one, which is `low`.
         let mut threshold = top.max(low);
         let mut total = 0usize;
         while threshold > low {
@@ -853,7 +1177,8 @@ impl Workspace {
         }
         let threshold = threshold as u16;
         self.candidates.clear();
-        // Candidates occupy few runs, so most of `counts` is never read.
+        // A few thousand candidates among 1.5M references occupy a small share
+        // of the 64-reference runs, so most of the array is never read.
         for ((lane, &max), counts) in self.lane_max.iter().enumerate().zip(self.counts.chunks(64)) {
             if max < threshold {
                 continue;
@@ -869,9 +1194,13 @@ impl Workspace {
 
     /// Build the word-major membership matrix for the selected candidates.
     ///
-    /// Each row is a bitmap over candidates that can be added straight into
-    /// the counter planes during the bootstrap. `words` must be ascending and
-    /// distinct, as from [`vocabulary`] and [`revcomp_vocabulary`].
+    /// Word-major because the bootstrap phase consumes it one sampled word at a
+    /// time: each row is a bitmap over candidates that can be added straight
+    /// into the counter planes.
+    ///
+    /// `words` must be ascending and distinct, as [`vocabulary`] and
+    /// [`revcomp_vocabulary`] produce it: a word's row is located by its rank in
+    /// the vocabulary rather than through a lookup table.
     pub fn project(&mut self, index: &Index, words: &[u16], weights: &weight::Table) -> Result<()> {
         ensure!(words.len() < VOCABULARY_CAP, "query vocabulary too large");
         ensure!(
@@ -885,7 +1214,7 @@ impl Workspace {
             self.present[word as usize / 64] |= 1 << (word % 64);
             self.shifts.push(weights.get(word).trailing_zeros() as u8);
         }
-        // Below the cap, so the running total can't overflow.
+        // Below the cap, so the running total cannot overflow.
         let mut below = 0u16;
         for (prefix, bits) in self.prefix.iter_mut().zip(self.present.iter()) {
             *prefix = below;
@@ -916,9 +1245,12 @@ impl Workspace {
 
     /// Exact maximum and complete tie set for one replicate, over candidates.
     ///
-    /// Scores are at most `SAMPLE_SIZE * max weight`; the drawn rows go through
-    /// the counting network in [`crate::bits`]. Candidate positions are in
-    /// reference order, so tie draws match the exact path.
+    /// Scores cannot exceed `SAMPLE_SIZE * max weight`: six planes unweighted,
+    /// eight at the widest tier. The 32 drawn rows go through the carry-save
+    /// network in [`crate::bits`], which produces those planes directly rather
+    /// than rippling each row through them in turn. The tie set is expressed
+    /// over candidate positions, which are ascending in reference order, so
+    /// the caller's uniform draw sees the same ordering the exact path would.
     pub fn replicate(&mut self, sample: &[u16; SAMPLE_SIZE]) -> Top {
         let lanes = self.candidates.len().div_ceil(64).max(1);
         let stride = bits::stride(lanes);
@@ -966,8 +1298,10 @@ impl Workspace {
         Top::from_bits(max as u8, ties)
     }
 
-    /// The candidates as a bitmap over all `n` references, and how many
-    /// precede each lane, for [`crate::scoring::bitsliced_tops`].
+    /// The selected candidates as a bitmap over all `n` references, and how
+    /// many candidates precede each 64-reference lane, for scoring them in
+    /// place with [`crate::scoring::bitsliced_tops`] instead of through
+    /// [`Workspace::project`].
     pub fn candidate_mask(&mut self, n: usize) -> (&[u64], &[u32]) {
         let lanes = n.div_ceil(64);
         self.mask.clear();
@@ -986,7 +1320,14 @@ impl Workspace {
         (&self.mask, &self.below)
     }
 
-    /// How many distinct [`TILE`]s the candidates fall in.
+    /// The bitmap and per-lane prefix [`Workspace::candidate_mask`] last built,
+    /// read back without borrowing the workspace mutably.
+    pub fn candidate_view(&self) -> (&[u64], &[u32]) {
+        (&self.mask, &self.below)
+    }
+
+    /// How many distinct [`TILE`]s of the database the candidates fall in.
+    /// Candidates are ascending, so this is a count of tile changes.
     pub fn candidate_tiles(&self) -> usize {
         let mut tiles = 0;
         let mut last = usize::MAX;
@@ -1000,23 +1341,30 @@ impl Workspace {
         tiles
     }
 
-    /// Reference id of the `offset`-th member of a replicate's tie set.
+    /// Reference id behind the `offset`-th member of a replicate's tie set.
     pub fn reference_at(&self, top: &Top, offset: usize) -> u32 {
         self.candidates[top.nth(offset) as usize]
     }
 }
 
-/// Risk bound for restricting replicates to the candidate set.
+/// How safe it was to restrict a replicate to the candidate set.
 ///
-/// A pruned reference's score is `Binomial(SAMPLE_SIZE, count(r) / vocabulary)`,
-/// so the chance any of them reaches the best score is at most the sum of
-/// their tail probabilities, computed from the count histogram.
+/// The obvious deterministic bound, `score(b, r) <= min(SAMPLE_SIZE, count(r))`,
+/// is useless: counts run into the hundreds while scores cap at 32, so it
+/// certifies nothing. Measured on 90%-identity cross-validation pairs it held
+/// for 0.0% of replicates at every candidate size tried.
+///
+/// What does work is the tail bound. Under the bootstrap's own randomness a
+/// pruned reference's score is `Binomial(SAMPLE_SIZE, count(r) / vocabulary)`,
+/// so the chance that any of them reaches the incumbent maximum is at most the
+/// sum of their tail probabilities -- and the rank pass has already produced
+/// the histogram of counts that sum needs.
 pub struct Bound {
     tail: Vec<f64>,
 }
 
 impl Bound {
-    /// Tail probabilities for one query strand, indexed by count.
+    /// Cache tail probabilities for one query-strand, indexed by count.
     pub fn new(histogram: &[u32], threshold: u16, vocabulary: usize, score: u8) -> Self {
         let mut tail = vec![0.0; histogram.len()];
         for (count, &references) in histogram.iter().enumerate().take(threshold as usize) {
@@ -1048,7 +1396,8 @@ fn binomial_tail(p: f64, score: u8) -> f64 {
     }
     let n = SAMPLE_SIZE;
     let mut total = 0.0;
-    // Sum from the top and stop once further terms are negligible.
+    // Terms fall off steeply above the mean, so accumulate from the top and
+    // stop once further terms cannot matter.
     let mut term = p.powi(n as i32);
     for k in (score as usize..=n).rev() {
         if k < n {
@@ -1095,10 +1444,11 @@ pub fn vocabulary(sequence: &[u8], seen: &mut [u64; WORDS / 64], out: &mut Vec<u
     }
 }
 
-/// Reverse complement of a word code.
+/// Reverse-complement a word code in place of re-extracting the sequence.
 ///
-/// Mapping the forward k-mer set gives the reverse strand's set without
-/// re-reading the sequence.
+/// The k-mer set of `revcomp(S)` is exactly the image of `S`'s under this map,
+/// so the reverse strand costs a table lookup per word instead of a second
+/// pass over the sequence.
 pub fn revcomp_word(word: u16) -> u16 {
     let mut out = 0u16;
     for i in 0..K {

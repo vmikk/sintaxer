@@ -9,31 +9,45 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-/// Which query strands are scored. `Plus` suits oriented amplicons.
+/// Which query strands are scored.
+///
+/// `Plus` is the default because oriented amplicons are the main use: a
+/// primer-oriented read has nothing to find on its reverse complement, and
+/// scoring it anyway doubles the cost of every query. vsearch's `--sintax`
+/// makes the same choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Strand {
-    /// Score both strands and keep the better, for input of mixed orientation.
+    /// Score both strands and keep the better. For input of mixed
+    /// orientation.
     Both,
-    /// Score the query as given, for reads already in forward orientation.
+    /// Score the query as given. For reads already in forward orientation.
     Plus,
 }
 /// Which decision rule turns the scored references into a lineage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Scorer {
-    /// Published SINTAX: per-rank plurality vote over the replicate winners.
+    /// The published rule: a per-rank plurality vote over the replicate
+    /// winners, reported as the fraction of replicates that agreed.
     Sintax,
-    /// PROTAX-style per-rank logistic model with a novel-taxon outcome; needs `--protax-params`.
+    /// A per-rank multinomial logistic over sibling taxa with an explicit
+    /// novel-taxon outcome, after PROTAX. Reports a probability rather than a
+    /// vote share, and needs `--protax-params`.
     Protax,
 }
-/// Part of the database hidden from each query, for training and validation.
+/// What a training run hides from itself.
+///
+/// PROTAX fits its coefficients on queries whose own taxon has been removed
+/// from the database to a chosen depth, so that the model sees the full range
+/// of "how close is the nearest relative" rather than only the easy end. Hiding
+/// is per query, against the production index, so one run measures what a
+/// rebuilt database would -- see `rank::Workspace::exclude`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Holdout {
-    /// References with exactly the query's k-mer set (the query itself and duplicates).
+    /// Every reference whose k-mer set equals the query's. The query's own
+    /// record and its exact duplicates, which is PROTAX's `nseq2` case: the
+    /// taxon keeps its other references.
     #[value(name = "self")]
     Identical,
     /// The query's whole domain.
@@ -46,7 +60,8 @@ pub enum Holdout {
     C,
     /// The query's whole order.
     O,
-    /// The query's whole family.
+    /// The query's whole family, so its genus is novel and so is every sibling
+    /// genus. This and `g` are the over-classification arms.
     F,
     /// The query's whole genus.
     G,
@@ -68,26 +83,34 @@ impl Holdout {
     }
 }
 
-/// How the candidate path scores a candidate set. Both give identical
-/// results; this is a speed choice only.
+/// How the candidate path turns a candidate set into replicate maxima.
+///
+/// Both give identical results -- the same maximum and the same tie set, in
+/// the same reference order -- so this is a speed choice only, and `Auto`
+/// makes it per query-strand from a cost estimate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Projection {
     /// Estimate both costs and take the cheaper.
     Auto,
-    /// Decode candidate sequences and count over candidate positions. Best on
-    /// large databases.
+    /// Decode every candidate's sequence into a compact word-by-candidate
+    /// matrix, then count over candidate positions. Cheap when the database is
+    /// much larger than the candidate set, because only candidates are read.
     Sequence,
-    /// Count straight from the index rows, masked to the candidates. Best on
-    /// small and mid-sized databases.
+    /// Score the candidates in place, straight from the index's word rows,
+    /// masking everything else out. No sequence is decoded; every tile holding
+    /// a candidate is counted in full, which is cheap while the database is
+    /// not much larger than the candidate set.
     Rows,
 }
 
 /// What a per-rank confidence is a fraction of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Support {
-    /// All replicates (the published denominator).
+    /// All `BOOTSTRAPS` replicates. The published denominator.
     Raw,
-    /// Only replicates whose winning reference is named at that rank.
+    /// Only the replicates that could speak to the rank -- those whose winning
+    /// reference carried a name there. A reference annotated no deeper than
+    /// family abstains at genus rather than diluting it.
     Adjusted,
 }
 #[derive(Clone, Debug)]
@@ -95,34 +118,44 @@ pub struct Config {
     pub seed: u64,
     pub cutoff: f64,
     pub strand: Strand,
-    /// Score every reference in every replicate, as published SINTAX does. Slow; used to check the fast path.
+    /// Score every reference in every replicate, as the published algorithm
+    /// does. Slow, and the reference against which the fast path is checked.
     pub exact: bool,
     /// Size the candidate set is grown to before the replicates run.
+    ///
+    /// 2048 is the smallest value measured to produce no differing call against
+    /// `--exact` on both real ITS databases tested -- 15,943 and 1,877,003
+    /// references, 1,935 queries each. It costs about 5% against 1024, which
+    /// differs on one call in 1,935 at the smaller size.
     pub candidates: usize,
-    /// Largest tolerated expected number of pruned references that could have won a
-    /// replicate. Exceeding it widens the candidate set.
+    /// Largest tolerated expected number of pruned references that would have
+    /// reached a replicate's maximum. Exceeding it widens the candidate set.
     pub risk: f64,
-    /// Per-word weight table used in scoring. `Off` is the published algorithm.
+    /// Which per-word weight table scoring uses. `Off` is the published
+    /// algorithm, bit-for-bit.
     pub weights: weight::Source,
     /// Percentage of occurring words treated as informative under `weights`.
     pub weight_share: u8,
     /// Denominator for the per-rank confidence.
     pub support: Support,
-    /// Under `Support::Adjusted`, the share of replicates that must be informative at a
-    /// rank before it is renormalized; below it the raw support is used.
+    /// Under `Support::Adjusted`, the share of `BOOTSTRAPS` that must be able
+    /// to speak to a rank before its confidence is renormalized. Below it the
+    /// rank falls back to its raw support.
     pub min_informative: f64,
     /// Append a fifth column holding the informative replicate count per rank.
     pub emit_informative: bool,
-    /// Decision rule. `Sintax` is the published one.
+    /// Decision rule. `Sintax` is the published one, bit-for-bit.
     pub scorer: Scorer,
-    /// Smallest cumulative probability worth descending below (PROTAX `prob_th`).
-    /// Ignored under `Scorer::Sintax`.
+    /// Smallest cumulative probability worth descending below, PROTAX's
+    /// `prob_th`. Ignored under `Scorer::Sintax`.
     pub floor: f64,
-    /// Hide part of the database from each query, for training and validation.
+    /// Hide part of the database from each query, for training and for
+    /// leave-one-clade-out validation. Off in every production run.
     pub holdout: Option<Holdout>,
     /// Write design-matrix rows instead of calls.
     pub emit_features: bool,
-    /// How the candidate path scores its candidates.
+    /// How the candidate path scores its candidates. Speed only; see
+    /// [`Projection`].
     pub projection: Projection,
 }
 impl Default for Config {
@@ -158,8 +191,12 @@ impl Config {
             self.risk.is_finite() && self.risk >= 0.0,
             "risk tolerance must be finite and non-negative"
         );
-        // `Bound` assumes an unweighted binomial score. Weighting breaks that model in the
-        // unsafe direction, so refuse to report a bound rather than report a wrong one.
+        // `Bound` models a replicate's score as Binomial(SAMPLE_SIZE, p) with
+        // p the unweighted match rate. Weighting breaks that model, and it
+        // breaks it optimistically -- it understates the risk for exactly the
+        // references that hold the rare, heavily weighted words. Reporting a
+        // bound that is wrong in the unsafe direction is worse than declining
+        // to report one.
         ensure!(
             self.risk == 0.0 || self.weights == weight::Source::Off,
             "--risk models unweighted scores and cannot be combined with --weights"
@@ -176,7 +213,10 @@ impl Config {
             self.floor.is_finite() && (0.0..1.0).contains(&self.floor),
             "probability floor must be finite and in [0,1)"
         );
-        // Hiding zeroes counts that the exact path never reads, so it would silently hide nothing.
+        // Hiding works by zeroing whole-vocabulary counts, and the exact path
+        // scores straight from the posting lists without consulting them. It
+        // would therefore hide nothing at all, silently, which is the worst
+        // possible failure for a training run.
         ensure!(
             self.holdout.is_none() || !self.exact,
             "--holdout cannot be combined with --exact: the exact path scores \
@@ -187,7 +227,10 @@ impl Config {
             "--emit-features needs --holdout: without it every query can see \
              its own reference and every row would be fitted to a self-match"
         );
-        // These describe the replicate vote, which the protax scorer does not have.
+        // `informative` and `support` both describe the replicate vote, and
+        // the protax scorer does not hold one: its confidence is a probability
+        // whose denominator is the whole outcome space, not a replicate count.
+        // Silently emitting zeros would be worse than refusing.
         ensure!(
             self.scorer == Scorer::Sintax
                 || (self.support == Support::Raw && !self.emit_informative),
@@ -203,21 +246,24 @@ pub struct Timings {
     pub extraction: Duration,
     pub sampling: Duration,
     pub scoring: Duration,
-    /// Part of `scoring` spent in the whole-vocabulary rank sweep.
+    /// The share of `scoring` spent in the whole-vocabulary rank sweep.
     pub rank: Duration,
     pub taxonomy: Duration,
     /// Whether any strand needed a wider candidate set than the default.
     pub escalated: bool,
-    /// Whether `--strand both` skipped the reverse strand; see `unbeatable`.
+    /// Whether `--strand both` skipped the reverse strand because the forward
+    /// one had already reached an outcome it cannot lose; see `unbeatable`.
     pub reverse_skipped: bool,
-    /// Candidate-set size summed over strands that took the candidate path, and the
-    /// number of such strands.
+    /// Candidate-set size summed over the strands that took the candidate
+    /// path, and how many strands those were. Ties at the threshold can carry
+    /// the set well past `--candidates`, and projection and the replicates both
+    /// scale with it.
     pub candidates: usize,
     pub candidate_strands: usize,
     /// Bytes that were neither ACGT nor a recognised ambiguity code.
     pub unknown_bases: usize,
 }
-/// One rank of a prediction: the chosen taxon and the votes it drew.
+/// One rank of a prediction: the taxon chosen there and the votes it drew.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankCall {
     /// Index into [`RANKS`].
@@ -232,22 +278,28 @@ impl RankCall {
     }
 }
 
-// No `Eq`: protax columns are floats.
+// `Eq` is deliberately absent: the protax columns are probabilities, and the
+// tests that compare predictions compare calls, not bit patterns of floats.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prediction {
     pub strand: Option<char>,
     pub ranks: Vec<RankCall>,
-    /// Replicates whose winning reference is named at each stored rank. Undefined at or
-    /// past `voted`.
+    /// Replicates that could speak to each stored rank -- those whose winning
+    /// reference carried a name there. Zero at a rank the vote reached but no
+    /// reference named; undefined at or past `voted`.
     pub informative: [u8; 7],
     /// How many ranks the vote reached before running out of candidates.
     pub voted: u8,
-    /// Ranks where the unnamed bloc matched or beat the best named taxon. Diagnostic only.
+    /// Ranks where the unnamed bloc matched or beat the best named taxon, and
+    /// so would have taken the rank under the pre-abstention vote. Diagnostic
+    /// only; it changes no call.
     pub abstention_pluralities: u8,
-    /// Probabilities under `Scorer::Protax`, parallel to `ranks`; empty under `Scorer::Sintax`.
+    /// Calibrated probabilities under `Scorer::Protax`, parallel to `ranks`.
+    /// Empty under `Scorer::Sintax`, which has none to report.
     pub probabilities: Vec<f64>,
-    /// Probability that the query belongs to no named child of this rank's parent,
-    /// parallel to `ranks` and on the same scale as `probabilities`.
+    /// `P(the query belongs to no named child of this rank's parent)`, parallel
+    /// to `ranks` and on the same absolute scale as `probabilities`. This is
+    /// the outcome the vote fraction cannot express.
     pub novel: Vec<f64>,
 }
 impl Prediction {
@@ -264,10 +316,15 @@ impl Prediction {
     }
     /// Per-rank confidence under `support`, made monotone down the lineage.
     ///
-    /// `Adjusted` alone can put a genus above its family; a running minimum restores
-    /// monotonicity so the cutoff still yields a prefix.
+    /// `Adjusted` divides by the replicates that could speak to the rank
+    /// rather than by all of them, which is not monotone: a genus can come out
+    /// above its own family. The cutoff column is a usable prefix only because
+    /// the raw counts never increase downwards, so the running minimum -- the
+    /// weakest link in the chain -- puts that property back.
     fn confidences(&self, support: Support, min_informative: f64) -> Vec<f64> {
-        // Protax probabilities multiply down the path, so they are already monotone.
+        // A protax lineage carries probabilities that already multiply down the
+        // path, so they are monotone by construction and there is nothing for
+        // the running minimum below to repair.
         if !self.probabilities.is_empty() {
             return self.probabilities.clone();
         }
@@ -277,12 +334,15 @@ impl Prediction {
             .iter()
             .map(|call| {
                 let informative = f64::from(self.informative[call.rank as usize]);
-                // Too few informative replicates: keep the raw support rather than inflate a few
-                // annotated hits inside a mostly unannotated clade.
+                // A rank too few replicates can speak to is not renormalized:
+                // a handful of annotated hits inside a mostly unannotated
+                // clade is the over-classification case, not a confident call.
                 let value = if support == Support::Raw || informative < floor {
                     f64::from(call.votes) / BOOTSTRAPS as f64
                 } else {
-                    // The winning named taxon's own votes are in `informative`, so this is never zero.
+                    // Every reported rank was won by a named taxon, so its own
+                    // votes are part of `informative` and this cannot divide
+                    // by zero.
                     f64::from(call.votes) / informative
                 };
                 running = running.min(value);
@@ -315,7 +375,11 @@ impl Prediction {
             .join(",");
         let mut line = format!("{label}\t{full}\t{}\t{filtered}", self.strand.unwrap());
         if config.scorer == Scorer::Protax {
-            // Novel-taxon probability, reported separately from the confidence.
+            // The probability that the query belongs to no named taxon under
+            // the rank above, at every rank the descent reached. Reported
+            // rather than folded into the confidence, because "0.4 confident
+            // it is Fusarium" and "0.5 confident it is nothing we have" are
+            // different statements and only the second says to stop.
             line.push('\t');
             line.push_str(
                 &self
@@ -353,6 +417,14 @@ pub struct Workspace {
     seen: Box<[u64; WORDS / 64]>,
 }
 
+impl Workspace {
+    /// Which blocked postings the rank sweep gathers before counting; see
+    /// [`rank::Staging`]. Predictions are identical either way.
+    pub fn set_staging(&mut self, staging: rank::Staging) {
+        self.rank.set_staging(staging);
+    }
+}
+
 impl Default for Workspace {
     fn default() -> Self {
         Self {
@@ -369,17 +441,27 @@ impl Default for Workspace {
 
 /// Positions drawn from the query vocabulary, with replacement.
 ///
-/// Positions rather than word codes, so the exact and candidate paths consume the
-/// RNG identically and stay comparable.
+/// Positions rather than word codes so the same draw feeds both paths: the
+/// exact path maps them back through the vocabulary, the candidate path uses
+/// them directly as rows of the membership matrix. The RNG stream is consumed
+/// identically either way, which is what keeps the two comparable.
 pub fn samples(vocabulary: usize, key: &blake3::Hash, strand: u8) -> Vec<[u16; SAMPLE_SIZE]> {
-    // All draws share one range, so set it up once.
+    // Every draw of the strand is from the same range, so its rejection
+    // threshold and reciprocal are set up once: `Uniform` returns exactly what
+    // `Rng::bounded` would.
     let uniform = rng::Uniform::new(vocabulary as u64);
-    (0..BOOTSTRAPS)
-        .map(|boot| {
-            let mut rng = rng::stream(key, strand, boot, 0);
-            std::array::from_fn(|_| uniform.sample(&mut rng) as u16)
-        })
-        .collect()
+    // The replicates' streams, hashed eight at a time; see `rng::streams8`.
+    let mut samples = Vec::with_capacity(BOOTSTRAPS);
+    for first in (0..BOOTSTRAPS).step_by(8) {
+        let boots = std::array::from_fn(|lane| (first + lane) as u32);
+        for mut rng in rng::streams8(key, strand, 0, boots)
+            .into_iter()
+            .take(BOOTSTRAPS - first)
+        {
+            samples.push(std::array::from_fn(|_| uniform.sample(&mut rng) as u16));
+        }
+    }
+    samples
 }
 
 /// One strand's replicate outcomes.
@@ -387,17 +469,28 @@ struct Outcome {
     max: u8,
     winners: Vec<u32>,
     escalated: bool,
-    /// Scored references for [`Scorer::Protax`]: the candidate set plus any replicate winner
-    /// outside it. Empty under [`Scorer::Sintax`]. Collected per strand, because the rank
-    /// pass overwrites its counts on the next strand.
+    /// Scored references for [`Scorer::Protax`]: the candidate set, plus any
+    /// replicate winner that fell outside it. Empty under [`Scorer::Sintax`].
+    ///
+    /// Collected per strand rather than after the strands are compared,
+    /// because the rank pass overwrites its count array on the second strand
+    /// and re-running it to recover the first would double the one pass that
+    /// dominates the whole program.
     hits: Vec<protax::Hit>,
-    /// Time spent in [`Workspace::rank`] for this strand.
+    /// Time spent inside [`Workspace::rank`] for this strand.
+    ///
+    /// Separated from `Timings::scoring`, which also covers projection, the
+    /// hundred replicates and any exact fallback. The rank sweep is the term
+    /// every optimisation of this crate is aimed at, so it is worth attributing
+    /// on its own rather than inferring it from a `--candidates` sweep.
     rank: Duration,
-    /// Final candidate-set size, or `None` when the strand took the exact path.
+    /// Size of the candidate set the replicates finally ran against, or
+    /// `None` when this strand took the exact path.
     candidates: Option<usize>,
 }
 
-/// The candidate set as PROTAX similarities, with outside replicate winners folded in.
+/// The candidate set as PROTAX similarities, with the replicate winners folded
+/// in so a winner from outside the candidate set still carries evidence.
 fn protax_hits(
     index: &Index,
     ws: &Workspace,
@@ -439,47 +532,66 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
     let mut informative = [0u8; 7];
     let mut voted = 0u8;
     let mut abstention_pluralities = 0u8;
+    // Votes per distinct node at the current rank, in first-seen order.
+    let mut tally: Vec<(u32, u8)> = Vec::new();
     for rank in 0..RANKS.len() {
-        // Keyed by name. All candidates share the selected ancestor here, so names identify
-        // nodes, and interning leaves at most one unnamed sentinel among them.
-        let mut counts = BTreeMap::<&str, (u32, u8)>::new();
-        for (i, lineage) in lineages.iter().enumerate() {
-            if included[i] {
-                let node = lineage[rank];
-                counts.entry(index.name(node)).or_insert((node, 0)).1 += 1;
+        // Tallied by node rather than by name. At this stage all candidates
+        // share the selected ancestor, so their nodes here are siblings, and
+        // interning gives each sibling name exactly one node -- including the
+        // one unnamed sentinel a parent can have. A node therefore identifies
+        // its name, and counting nodes is counting names, without building a
+        // map of strings or re-checking their UTF-8.
+        tally.clear();
+        for (lineage, _) in lineages.iter().zip(&included).filter(|(_, keep)| **keep) {
+            let node = lineage[rank];
+            match tally.iter_mut().find(|(seen, _)| *seen == node) {
+                Some((_, votes)) => *votes += 1,
+                None => tally.push((node, 1)),
             }
         }
-        if counts.is_empty() {
+        if tally.is_empty() {
             break;
         }
         voted += 1;
-        // A missing rank is an abstention, not a competing taxon. Interning merges all
-        // unannotated siblings into one node, which would otherwise outvote split named ones.
-        let mut best: Option<(&str, u32, u8)> = None;
-        let mut unnamed: Option<(&str, u32, u8)> = None;
-        for (name, (node, count)) in counts {
+        // A missing rank is an abstention, not a competing hypothesis: the
+        // reference says nothing about this rank, so it must not outvote the
+        // references that do. Leaving it in is worse than it looks, because
+        // interning collapses every unannotated sibling under a parent onto
+        // one node -- so the bloc votes together while annotated siblings
+        // split, it wins ties outright, and it then gates every rank below.
+        //
+        // Among named nodes the most votes win, and equal votes go to the
+        // lexicographically first name: byte order is `str` order, so this is
+        // the taxon the published vote picks when it walks its names sorted.
+        let mut best: Option<(u32, u8)> = None;
+        let mut unnamed: Option<(u32, u8)> = None;
+        for &(node, votes) in &tally {
+            let name = index.name_bytes(node);
             if name.is_empty() {
-                unnamed = Some((name, node, count));
+                unnamed = Some((node, votes));
             } else {
-                informative[rank] += count;
-                if best.is_none_or(|(_, _, c)| count > c) {
-                    best = Some((name, node, count));
+                informative[rank] += votes;
+                if best.is_none_or(|(held, most)| {
+                    votes > most || (votes == most && name < index.name_bytes(held))
+                }) {
+                    best = Some((node, votes));
                 }
             }
         }
-        if let (Some((_, _, abstained)), Some((_, _, named))) = (unnamed, best) {
+        if let (Some((_, abstained)), Some((_, named))) = (unnamed, best) {
             abstention_pluralities += u8::from(abstained >= named);
         }
-        // No named candidate: keep the sentinel so an annotation gap can still reach a named
-        // lower rank.
-        let (name, node, count) = best.or(unnamed).expect("counts is not empty");
-        for (i, lineage) in lineages.iter().enumerate() {
-            included[i] &= lineage[rank] == node;
+        // No named candidate at all leaves the rank genuinely unresolved. Keep
+        // the sentinel then, so an internal annotation gap can still reach an
+        // annotated lower rank.
+        let (node, count) = best.or(unnamed).expect("tally is not empty");
+        for (keep, lineage) in included.iter_mut().zip(&lineages) {
+            *keep &= lineage[rank] == node;
         }
-        if !name.is_empty() {
+        if best.is_some() {
             ranks.push(RankCall {
                 rank: rank as u8,
-                name: name.to_owned(),
+                name: index.name(node).to_owned(),
                 votes: count,
             });
         }
@@ -500,6 +612,11 @@ pub fn consensus(index: &Index, winners: &[u32], strand: char) -> Prediction {
 }
 
 /// Every replicate scored against the whole database, as published SINTAX does.
+///
+/// Bit-sliced over tiles of the database rather than one scalar pass per
+/// replicate; see [`scoring::bitsliced_tops`]. The scalar scan it replaced,
+/// `scoring::scalar_scores` with `Top::from_scores`, is kept as the oracle the
+/// tests hold this against.
 fn exact_tops(
     index: &Index,
     words: &[u16],
@@ -514,18 +631,22 @@ fn exact_tops(
         weights,
         scoring::Eligible::All,
         false,
+        None,
         &mut ws.engine,
     )
 }
 
-/// Expected number of replicates whose winner could have differed had the pruned
-/// references been scored.
+/// Expected number of replicates whose winner could have differed, had the
+/// pruned references been scored.
 fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabulary: usize) -> f64 {
-    // Indexed by score, so it must span the weighted ceiling, not just SAMPLE_SIZE.
+    // Indexed by score, so it must span the weighted ceiling and not just
+    // SAMPLE_SIZE. `Config::validate` rejects --risk under weighting, but an
+    // out-of-bounds panic is not the way to enforce that.
     let mut cache = [f64::NAN; SAMPLE_SIZE * weight::MAX_WEIGHT as usize + 1];
     let mut risk = 0.0;
     for top in tops {
-        // Scores below two are never recorded, so that is the floor a pruned reference must reach.
+        // Below a score of two nothing is recorded either way, so that is the
+        // floor a pruned reference would have to reach to matter.
         let score = top.score.max(2) as usize;
         if cache[score].is_nan() {
             cache[score] = Bound::new(histogram, threshold, vocabulary, score as u8).risk();
@@ -538,14 +659,19 @@ fn strand_risk(tops: &[scoring::Top], histogram: &[u32], threshold: u16, vocabul
 /// One query's hidden set, resolved against the index.
 #[derive(Clone, Copy, Debug)]
 pub enum Hide {
-    /// References holding exactly the query's k-mers: all of its words and no others.
+    /// References holding exactly the query's k-mers: its own record, and any
+    /// duplicate of it. Recognised from the counts the rank pass already has --
+    /// a reference matches every one of the query's words and has no others --
+    /// so no sequence comparison is needed.
     Identical,
     /// Everything under one node.
     Clade { node: u32, rank: usize },
 }
 
 impl Hide {
-    /// Whether one reference is hidden. `Clade` walks up from the leaf.
+    /// Whether one reference is hidden. `Clade` walks up from the leaf rather
+    /// than down from the root, so hiding a genus costs a single load and
+    /// hiding a domain costs six.
     fn rejects(&self, index: &Index, reference: usize, count: u16, vocabulary: usize) -> bool {
         match *self {
             Self::Identical => {
@@ -565,8 +691,10 @@ impl Hide {
 
 /// Resolve `--holdout` against one query's own annotation.
 ///
-/// `None` when there is nothing to hide: no holdout, or the query has no taxon (or an
-/// unknown one) at that rank.
+/// Returns `None` when there is nothing to hide: no holdout configured, or the
+/// query names no taxon at the chosen rank, or it names one this database has
+/// never heard of. All three mean the query is already as novel as the holdout
+/// was trying to make it.
 pub fn hide_for(config: &Config, locator: &Locator, label: &str) -> Result<Option<Hide>> {
     let Some(holdout) = config.holdout else {
         return Ok(None);
@@ -582,7 +710,8 @@ pub fn hide_for(config: &Config, locator: &Locator, label: &str) -> Result<Optio
     Ok(locator.locate(&lineage)[rank].map(|node| Hide::Clade { node, rank }))
 }
 
-/// Whether a query-strand uses the candidate path rather than the exact one.
+/// Whether a query-strand is scored against a candidate set drawn from the
+/// rank sweep, rather than by the exact path. See [`score_strand`].
 fn ranks_candidates(index: &Index, config: &Config, hide: Option<Hide>) -> bool {
     (!config.exact && index.references > config.candidates.saturating_mul(4)) || hide.is_some()
 }
@@ -597,8 +726,23 @@ enum Coordinates {
     References,
 }
 
-/// Choose how to score one strand's candidate set, from a rough cost model.
-/// A poor estimate costs time, never a different call.
+/// Choose how to score one strand's candidate set. See [`Projection`].
+///
+/// Both strategies produce the same tops, so this is a cost model and
+/// nothing more; a poor estimate costs time, never a different call.
+///
+/// - rows: every tile holding a candidate materialises each drawn word's row
+///   for its 64 lanes, then counts those lanes once per replicate;
+/// - sequence: every candidate's bases are decoded and probed, then each
+///   replicate counts over the compact candidate lanes.
+///
+/// The weights are cycles fitted on this project's reference machine against
+/// both strategies timed query by query, from 12k to 1.5M references
+/// (docs/Optimization_round_5.md §4). Only their ratios matter. Rows win by
+/// 4-11x on databases the size of the taxxi sets and lose by 3-4x on the
+/// full EUKARYOME; the break-even sits near 200k references for ITS-length
+/// queries, because the candidates then fall in so many tiles that counting
+/// whole tiles costs more than decoding just the candidates.
 fn projection_for(
     index: &Index,
     config: &Config,
@@ -609,7 +753,8 @@ fn projection_for(
     if config.projection != Projection::Auto {
         return config.projection;
     }
-    // Rough cycles per lane-row materialised, lane counted and base decoded.
+    // Cycles per lane-row materialised, per lane per replicate counted, and
+    // per candidate base decoded.
     const MATERIALISE_LANE: usize = 8;
     const COUNT_LANE: usize = 40;
     const DECODE_BASE: usize = 8;
@@ -629,6 +774,9 @@ fn projection_for(
 }
 
 /// Score every replicate of one strand, exactly or against candidates.
+// The inputs are a query-strand, its draws, the RNG key, and the two pieces of
+// configuration; bundling them into a struct would only move the same list one
+// level out.
 #[allow(clippy::too_many_arguments)]
 fn score_strand(
     index: &Index,
@@ -644,18 +792,26 @@ fn score_strand(
 ) -> Result<Outcome> {
     let mut escalated = false;
     let mut ranking = Duration::ZERO;
-    // With a candidate set that is a large share of the database, the rank pass and
-    // projection cost more than scoring everything, so small databases go exact.
-    // Hiding only works on the candidate path, so it always takes it.
+    // The candidate path buys nothing when the candidate set is a large share
+    // of the database: the rank pass and the projection then cost more than
+    // simply scoring everything. Small references collections go straight to
+    // the exact path, which is also why the taxxi cross-validation databases
+    // -- a couple of thousand references -- never exercise the fast one.
+    //
+    // Hiding is the exception: it is enforced by zeroing counts, which only the
+    // candidate path reads, so a training run takes that path at any database
+    // size and accepts the cost.
     let worth_it = ranks_candidates(index, config, hide);
     let mut from_candidates = worth_it;
-    // Whether tie offsets are candidate positions or reference ids.
+    // Where a tie's offset is counted: among candidate positions after a
+    // sequence projection, among references otherwise. Both orders are
+    // ascending reference order, so either names the same winner.
     let mut coordinates = Coordinates::References;
     let mut tops = if !worth_it {
         exact_tops(index, words, samples, weights, ws)?
     } else {
         match ranked {
-            // Already swept with its batch.
+            // Swept already, alongside the rest of its batch.
             Some(slot) => ws.rank.adopt(slot),
             None => {
                 let start = Instant::now();
@@ -668,8 +824,10 @@ fn score_strand(
             ws.rank
                 .exclude(|reference, count| hide.rejects(index, reference, count, vocabulary));
         }
-        // Widen the candidate set a couple of times at most, then fall back to the exact
-        // path. Worst case is one rank pass plus one exact scan.
+        // Widening the candidate set is worth trying once or twice; past that
+        // the projection costs more than simply scoring everything, so the
+        // fallback is the exact path rather than an ever-wider matrix. That
+        // caps the worst case at one rank pass plus one exact scan.
         let ceiling = config.candidates.saturating_mul(64).min(index.references);
         let mut target = config.candidates;
         loop {
@@ -678,13 +836,15 @@ fn score_strand(
             coordinates = Coordinates::Candidates;
             let tops = match projection_for(index, config, words, samples, &ws.rank) {
                 Projection::Rows => {
-                    // A candidate matching the whole vocabulary saturates every replicate.
+                    // A candidate matching the whole vocabulary saturates
+                    // every replicate; see `bitsliced_tops`.
                     let saturated = ws
                         .rank
                         .candidates
                         .iter()
                         .any(|&r| usize::from(ws.rank.counts[r as usize]) == words.len());
-                    let (mask, below) = ws.rank.candidate_mask(index.references);
+                    ws.rank.candidate_mask(index.references);
+                    let (mask, below) = ws.rank.candidate_view();
                     scoring::bitsliced_tops(
                         index,
                         words,
@@ -692,6 +852,8 @@ fn score_strand(
                         weights,
                         scoring::Eligible::Candidates { mask, below },
                         saturated,
+                        // The rows the sweep for these words has just looked up.
+                        Some(ws.rank.row_refs()),
                         &mut ws.engine,
                     )?
                 }
@@ -700,8 +862,11 @@ fn score_strand(
                     samples.iter().map(|s| ws.rank.replicate(s)).collect()
                 }
             };
-            // Ties can push the set far past its target, making projection dearer than an exact
-            // scan; a threshold no candidate exceeds means the rank pass separated nothing.
+            // Ties at the threshold can carry the set far past its target, and
+            // once it is a large share of the database the projection costs
+            // more than an exact scan would have. Likewise a threshold that no
+            // candidate exceeds means the rank pass separated nothing, so there
+            // is no ranking to trust.
             let oversized = ws.rank.candidates.len() * 2 >= index.references;
             let unseparated = ws
                 .rank
@@ -716,7 +881,9 @@ fn score_strand(
             escalated = true;
             if oversized || unseparated || target >= ceiling || threshold <= 1 {
                 if hide.is_some() {
-                    // The exact fallback ignores hiding, so keep the candidate result.
+                    // The exact fallback scores from the posting lists, which
+                    // hiding does not touch. Keeping the candidate result is
+                    // worse evidence; falling back would be wrong evidence.
                     break tops;
                 }
                 from_candidates = false;
@@ -727,24 +894,46 @@ fn score_strand(
         }
     };
     tops.truncate(BOOTSTRAPS);
-    // Read before the protax re-selection resizes the set.
+    // Read before the protax re-selection below resizes the set.
     let candidates = from_candidates.then_some(ws.rank.candidates.len());
 
+    // Which member of each replicate's tie set wins: one draw from the
+    // replicate's tie stream, those streams hashed eight at a time. A lone
+    // maximiser needs no draw -- `bounded(1)` is zero whatever the stream
+    // holds, and the stream is dropped unread after it -- so skipping its
+    // hash changes nothing but the time.
+    let tied: Vec<usize> = tops
+        .iter()
+        .enumerate()
+        .filter(|(_, top)| top.score >= weight::FLOOR && top.count > 1)
+        .map(|(boot, _)| boot)
+        .collect();
+    let mut offsets = [0usize; BOOTSTRAPS];
+    for batch in tied.chunks(8) {
+        // A short last batch repeats its first replicate in the spare lanes.
+        let boots = std::array::from_fn(|lane| *batch.get(lane).unwrap_or(&batch[0]) as u32);
+        for (&boot, mut ties) in batch.iter().zip(rng::streams8(key, strand, 1, boots)) {
+            offsets[boot] = ties.bounded(tops[boot].count as u64) as usize;
+        }
+    }
     let mut max = 0;
     let mut winners = Vec::with_capacity(BOOTSTRAPS);
     for (boot, top) in tops.iter().enumerate() {
         max = max.max(top.score);
         if top.score >= weight::FLOOR {
-            let mut ties = rng::stream(key, strand, boot, 1);
-            let offset = ties.bounded(top.count as u64) as usize;
+            let offset = offsets[boot];
             winners.push(match coordinates {
                 Coordinates::Candidates => ws.rank.reference_at(top, offset),
                 Coordinates::References => top.nth(offset),
             });
         }
     }
-    // Protax needs the whole-vocabulary counts, which the exact path never computes.
-    // Re-selecting also keeps the feature window the same size after an escalation.
+    // Protax reads the whole-vocabulary counts, which the exact path never
+    // computes -- and a database small enough to take the exact path is
+    // exactly where the sweep is cheapest. Re-selecting unconditionally also
+    // bounds the feature window after an escalation has widened it: the
+    // candidate set is the horizon within which a taxon can be seen at all,
+    // so it should be the same size whatever the replicates needed.
     let hits = if config.scorer == Scorer::Protax || config.emit_features {
         if !worth_it {
             let start = Instant::now();
@@ -768,17 +957,29 @@ fn score_strand(
 
 /// Whether no other strand can displace this outcome.
 ///
-/// The incumbent keeps ties, so a strand at the maximum possible score with every
-/// replicate voting cannot lose and the reverse strand can be skipped.
+/// Strands are compared on `(max, winners.len())`, strictly, and the incumbent
+/// keeps a tie. A strand that reached the highest score any replicate can
+/// produce, with every replicate voting, can therefore at best be tied -- so
+/// the reverse strand need not be scored at all. Predictions are unchanged by
+/// construction; what changes is the time taken and, when the skipped strand
+/// would have escalated, the `escalated_queries` diagnostic.
+///
+/// Under weighting the ceiling is `SAMPLE_SIZE` draws of the heaviest tier,
+/// which a real replicate almost never reaches, so the skip is in practice an
+/// unweighted optimisation.
 fn unbeatable(outcome: &Outcome, weights: &weight::Table) -> bool {
     usize::from(outcome.max) == SAMPLE_SIZE * usize::from(weights.max())
         && outcome.winners.len() == BOOTSTRAPS
 }
 
-/// Score the configured strands and keep the better, with everything a scorer reads.
-/// Under `--strand both` the reverse is skipped when the forward is [`unbeatable`].
+/// Score the configured strands and keep the better, with everything a scorer
+/// reads. Under `--strand both` the reverse strand is skipped when the forward
+/// one is already [`unbeatable`].
 ///
-/// Shared by classification and training-row emission so both see the same evidence.
+/// Extracted so that classification and training-row emission run the identical
+/// path: a feature row fitted against evidence the classifier would not have
+/// seen is worse than no fit at all.
+///
 /// `Ok(None)` means the query has too few distinct words to sample from.
 fn best_strand(
     index: &Index,
@@ -795,8 +996,8 @@ fn best_strand(
     strands(index, &key, config, weights, hide, None, ws, timings)
 }
 
-/// Extract a query's forward vocabulary into `ws.forward` and derive its RNG key.
-/// `None` when it has too few distinct words to sample from.
+/// Extract a query's forward vocabulary into `ws.forward` and derive its RNG
+/// key. `None` when it has too few distinct words to sample from.
 fn prepare(
     sequence: &[u8],
     config: &Config,
@@ -811,8 +1012,9 @@ fn prepare(
     (ws.forward.len() >= SAMPLE_SIZE).then(|| rng::query_key(config.seed, &normalized))
 }
 
-/// The strand loop of [`best_strand`] for an already [`prepare`]d query. `ranked` is
-/// its batch slot when [`classify_batch`] has swept it.
+/// The strand loop of [`best_strand`], for a query [`prepare`] has already
+/// extracted. `ranked` is the batch slot holding its forward strand's rank
+/// sweep, when [`classify_batch`] has swept it already.
 #[allow(clippy::too_many_arguments)]
 fn strands(
     index: &Index,
@@ -908,12 +1110,19 @@ pub fn classify(
     Ok((prediction, timings))
 }
 
-/// Queries [`classify_batch`] sweeps together, so shared index rows are read once per batch.
+/// Queries [`classify_batch`] sweeps together. The dense rows they share are
+/// read from DRAM once per batch instead of once per query
+/// (docs/RANK_round3.md §E).
 pub const BATCH: usize = 2;
 
-/// [`classify`] for several queries, with their forward rank sweeps done in one pass.
-/// Results are identical to calling [`classify`] per query; anything the batch cannot
-/// handle falls back to the single-query path.
+/// [`classify`] for several queries, their forward-strand rank sweeps done
+/// together in one pass over the index. Predictions are identical to calling
+/// [`classify`] on each query in turn: every count is computed by the same
+/// kernels, and nothing else is shared.
+///
+/// One result per query, in order. Anything the batch cannot handle -- a
+/// configuration error, a query whose sweep fails -- falls back to the
+/// one-query path, so each error is reported against its own query.
 pub fn classify_batch(
     index: &Index,
     sequences: &[&[u8]],
@@ -938,7 +1147,8 @@ pub fn classify_batch(
         return one_by_one(ws);
     }
 
-    // Extract vocabularies and assign batch slots.
+    // Extract every vocabulary, and note which queries sweep and into which
+    // batch slot.
     let mut timings = vec![Timings::default(); sequences.len()];
     let mut keys = Vec::with_capacity(sequences.len());
     let mut slots = vec![None; sequences.len()];
@@ -963,7 +1173,7 @@ pub fn classify_batch(
     if ws.rank.rank_batch(index, &vocabularies).is_err() {
         return one_by_one(ws);
     }
-    // Split the shared sweep time evenly between queries.
+    // The sweep is shared; charge each query an equal part of it.
     let share = start.elapsed() / swept.max(1) as u32;
 
     let mut results = Vec::with_capacity(sequences.len());
@@ -993,7 +1203,8 @@ pub fn classify_batch(
                 let prediction = predict(index, &outcome, strand, config, params, ws, &mut timings);
                 (prediction, timings)
             }
-            // Unreachable: strand zero is always scored.
+            // Not reached -- `prepare` admitted the query, so strand zero is
+            // always scored -- but unclassified is the safe answer.
             None => (Prediction::unclassified(), timings),
         });
         results.push(result);
@@ -1001,7 +1212,8 @@ pub fn classify_batch(
     results
 }
 
-/// Turn the winning strand's evidence into a prediction under the configured scorer.
+/// Turn the winning strand's evidence into a prediction under the configured
+/// scorer.
 fn predict(
     index: &Index,
     outcome: &Outcome,
@@ -1024,8 +1236,10 @@ fn predict(
 
 /// Turn one strand's evidence into a lineage under [`Scorer::Protax`].
 ///
-/// Uses the same unclassified guard as [`consensus`], so both scorers agree on queries
-/// with no usable hit.
+/// The unclassified guard is shared with [`consensus`] deliberately: a query
+/// fewer than half the replicates could score at all is not a calibration
+/// problem, it is a query with no usable hit, and the two scorers should agree
+/// about that.
 fn protax_consensus(
     index: &Index,
     outcome: &Outcome,
@@ -1061,7 +1275,9 @@ fn protax_consensus(
         prediction.ranks.push(RankCall {
             rank: step.rank,
             name: index.name(step.node).to_owned(),
-            // Not the confidence here, but `--profile` and callers still read it.
+            // The replicate share is no longer the confidence, but it is still
+            // the cheapest honest summary of how the bootstrap saw this node,
+            // and `--profile` and the tests both read it.
             votes: u8::try_from(
                 outcome
                     .winners
@@ -1077,16 +1293,29 @@ fn protax_consensus(
     prediction
 }
 
-/// Column names of the design-matrix dump, in output order.
+/// Column names of the design-matrix dump, and the order `taxxi/fit_protax.py`
+/// reads them in.
 pub const FEATURE_HEADER: &str =
     "query\trank\tkind\tnode\ts1\tgap\tvote\tgenera\tsentinel\tmultiplicity\ttruth\n";
 
-/// Emit the design matrix along the query's own lineage instead of a call.
+/// Emit the design matrix along the query's *own* lineage instead of a call.
 ///
-/// Rows follow the query's annotation, not the model's choice, so they are trainable.
-/// `kind=present` rows are named children with a scored reference; `kind=absent` pools
-/// the rest with a `multiplicity`. The all-zero unknown branch is never written;
-/// a group without `truth=1` means the unknown branch is the true outcome.
+/// The descent follows the annotation the query carries, not the model's
+/// preference. That is what makes the rows trainable: PROTAX builds `X` at the
+/// true parent node (`create_xdata4Q.pl`), because a row collected under a
+/// parent the model guessed would only ever teach it to agree with itself.
+///
+/// One line per row of one rank's design matrix:
+///
+/// * `kind=present` -- a named child at least one scored reference fell under.
+/// * `kind=absent` -- the named children nothing fell under, pooled into one
+///   line whose `multiplicity` is how many there are. They share a design row,
+///   so the likelihood needs their count, not their identities.
+///
+/// The unknown branch is never written: its row is all zeros by definition, so
+/// the fitter adds it itself. `truth=1` marks the outcome that actually
+/// happened; no `truth=1` in a group means the unknown branch is the outcome,
+/// which is what `--holdout` manufactures.
 #[allow(clippy::too_many_arguments)]
 pub fn training_rows(
     index: &Index,
@@ -1116,10 +1345,15 @@ pub fn training_rows(
     ws.protax.prepare(index, &outcome.hits, &outcome.winners);
     let mut parent = 0u32;
     for rank in 0..protax::LEVELS {
-        // Taxon not in this database: stop here.
+        // A rank whose name this database does not hold cannot be located
+        // under the parent the ranks above resolved to, so the lineage stops
+        // teaching here and so does the dump.
         let Some(node) = truth[rank] else { break };
-        // Blank rank in the query: descend through the sentinel without emitting rows,
-        // since real databases skip ranks.
+        // A rank the query leaves blank cannot label a row: the truth there is
+        // the parent's unnamed sentinel, which is an absence of evidence and
+        // not one of the outcomes. Descend through it and keep going. Real
+        // databases skip ranks -- `rdp_its` names no kingdom at all -- so
+        // breaking here would emit domain rows and nothing else.
         if lineage[rank].is_none() {
             parent = node;
             continue;
@@ -1148,7 +1382,10 @@ pub fn training_rows(
             ));
         }
         if design.absent > 0 {
-            // True child present in the database but unseen by this query (PROTAX's `nseq0`).
+            // The true child is among the absent ones exactly when the
+            // database holds the taxon but this query saw nothing of it --
+            // which is what hiding a clade manufactures, and is PROTAX's
+            // `nseq0` case.
             let hit = target.is_some() && !resolved;
             out.push_str(&format!(
                 "{label}\t{code}\tabsent\t0\t0\t0\t0\t0\t{:.6}\t{}\t{}\n",

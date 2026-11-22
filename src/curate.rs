@@ -1,6 +1,19 @@
-//! Reference database curation: reduce each stored lineage to a few diverse
-//! representatives so that copy counts stop acting as a prior. Two passes
-//! (survey, then emit); query scoring is never affected.
+//! Reference-database curation.
+//!
+//! SINTAX stores only `d,k,p,c,o,f,g` (species is parsed and discarded, see
+//! `taxonomy::parse`), and breaks ties among equal-scoring top hits uniformly
+//! at random over the whole tie set. Together those mean a reference database's
+//! *copy counts* act as a prior: a genus with forty thousand near-identical
+//! members outvotes a singleton genus forty thousand to one, for reasons that
+//! reflect sequencing effort rather than ecology.
+//!
+//! Curation reduces a database to diverse representatives per stored lineage.
+//! It runs in two passes -- survey, then emit -- because a group's diversity
+//! cannot be known until the whole group has been seen, and because the index
+//! builder mints dense reference IDs in input order and so cannot host a filter.
+//!
+//! This module never changes how a query is scored. `ALGORITHM_VERSION` stays
+//! put; [`crate::sketch::CURATION_VERSION`] versions the selection contract.
 
 use crate::{
     WORDS, input,
@@ -11,12 +24,18 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{io::Write, path::Path};
 
-/// Sketch width. Coarse for measuring identity, but enough for ranking
-/// candidates by dissimilarity.
+/// Sketch width. Bottom-32 over a 65,536-word universe has a standard error of
+/// about 0.03 at J = 0.97, which is coarse for *measuring* identity but ample
+/// for *ranking* "least like what I already picked", which is all selection
+/// needs.
 pub const SKETCH: usize = 32;
 
-/// Properties of a record itself. Policy thresholds are applied later by
-/// [`Policy`], so one survey can serve many policies (see [`save`], [`load`]).
+/// Properties of a record itself, not of any policy.
+///
+/// Everything a threshold decides -- too long, too short, too ambiguous -- is
+/// derived from the measurements in [`Summary`] by the [`Policy`] predicates
+/// instead of being baked in here. That is what lets a survey be computed once
+/// and reused across a policy sweep; see [`save`] and [`load`].
 pub mod flag {
     /// Neither family nor genus annotated.
     pub const SHALLOW: u8 = 1 << 0;
@@ -30,8 +49,8 @@ pub struct Policy {
     pub cap: usize,
     /// Soft length threshold: flags `DEMOTED`, never drops.
     pub demote_length: usize,
-    /// Hard length ceiling. `None` (the default) keeps every length; on an
-    /// untrimmed database a ceiling can delete whole genera.
+    /// Hard length ceiling. `None` keeps every length, which is the default:
+    /// on an untrimmed database a ceiling deletes whole genera.
     pub max_length: Option<usize>,
     /// Maximum non-ACGT fraction.
     pub max_ambiguity: f64,
@@ -43,26 +62,35 @@ pub struct Policy {
     pub cover_bands: usize,
     /// Caps for records with neither family nor genus.
     pub shallow: ShallowCaps,
-    /// Validation switches; not meant for production databases.
+    /// Validation arms. Neither belongs in a production database: the first
+    /// measures what the over-classification guards are worth, the second what
+    /// the organellar decoys cost.
     pub drop_shallow: bool,
     pub drop_organellar: bool,
 }
 
 /// Caps for under-annotated records, by the guard role they play.
 ///
-/// These guard against over-classification, so they are capped, not deleted.
-/// They are capped harder because missing ranks collapse into one empty node
-/// per parent and would otherwise vote as a bloc.
+/// These are the SINTAX paper's Fig. 1 defence against over-classification: a
+/// query from a lineage nobody has named should hit an unnamed neighbour, not
+/// be forced onto the nearest named genus. So they are capped, never deleted.
+///
+/// They are capped *harder* than annotated lineages because `TreeBuilder`
+/// interns every missing rank under a parent as one empty node, so they vote as
+/// a bloc while annotated siblings split across many nodes -- and consensus
+/// resolves ties in favour of the empty name, which sorts first. Left uncapped
+/// they can win a rank outright and gate every rank below it.
 #[derive(Clone, Copy, Debug)]
 pub struct ShallowCaps {
-    /// Order already has genus-annotated members; keep only a token guard.
+    /// Order already has genus-annotated members: an annotated relative already
+    /// covers this ground, so keep only a token guard.
     pub covered: usize,
-    /// Order has no genus coverage; these are its only representatives.
+    /// Order has no genus coverage: these are its only representatives.
     pub orphan_order: usize,
-    /// No order at all: deep-branching environmental diversity, most important
-    /// at high ranks.
+    /// No order at all: deep-branching environmental diversity, and the guard
+    /// that matters most at high ranks.
     pub unplaced: usize,
-    /// Also cap `covered` groups relative to their annotated siblings, so a
+    /// Cap `covered` groups relative to their annotated siblings as well, so a
     /// sparsely annotated order keeps proportionally fewer guards.
     pub ratio: f64,
 }
@@ -81,8 +109,12 @@ impl Default for ShallowCaps {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            // Sensitivity drops sharply below a few hundred per lineage, genus faster
-            // than family.
+            // Measured, not assumed. On EUKARYOME ITS against 300 real ITS
+            // queries, cap 1000 costs 0.7 points of family sensitivity and 2.5
+            // of genus for a 2.07x speedup, while cap 25 costs 16 and 24 points
+            // for 5.6x. Sensitivity falls off a cliff below a few hundred, and
+            // genus falls faster than family because a family pools the
+            // references of all its genera. See docs/CURATION.md.
             cap: 1000,
             demote_length: 2_000,
             max_length: None,
@@ -98,7 +130,7 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Longer than the soft length threshold: sorts last among candidates but is
+    /// Longer than the soft hazard threshold: sorts last among candidates,
     /// never dropped for it.
     pub fn demoted(&self, summary: &Summary) -> bool {
         summary.length as usize > self.demote_length
@@ -115,20 +147,23 @@ impl Policy {
         summary.length > 0
             && f64::from(summary.ambiguous) / f64::from(summary.length) > self.max_ambiguity
     }
-    /// Hard rejects, applied before anything takes a cap slot.
+    /// Hard rejects: run before anything consumes a cap slot.
     pub fn rejects(&self, summary: &Summary) -> bool {
         self.low_complexity(summary) || self.ambiguous(summary) || self.oversize(summary)
     }
 }
 
-/// One record's pass-1 summary: everything selection needs, so that pass 2
-/// is a plain byte copy. Policy-free, so it can be cached across runs.
+/// One record's pass-1 summary: everything selection needs, so that pass 2 is a
+/// byte copy and the 1.3 Gbp input is parsed at most twice.
+///
+/// Deliberately policy-free. Every field is a measurement of the record, so the
+/// same survey serves any policy and can be cached across a sweep.
 #[derive(Clone, Debug)]
 pub struct Summary {
-    /// Position in the input, counting records that failed to parse. Pass 2
-    /// matches on this.
+    /// Position in the input, counting records that failed to parse. This is
+    /// what pass 2 matches on.
     pub ordinal: u32,
-    /// Node ID of the rank-6 leaf, i.e. the distinct stored lineage.
+    /// Node ID of the rank-6 leaf: the distinct stored lineage.
     pub group: u32,
     pub length: u32,
     pub words: u32,
@@ -138,7 +173,7 @@ pub struct Summary {
     pub flags: u8,
 }
 
-/// A distinct stored lineage and the node IDs of its seven ranks.
+/// A distinct stored lineage, and the node IDs of its seven ranks.
 #[derive(Clone, Debug)]
 pub struct Group {
     pub leaf: u32,
@@ -156,13 +191,18 @@ pub struct Survey {
     pub bases: u64,
     pub unknown_bases: u64,
     pub unknown_records: u64,
-    /// Records `taxonomy::parse` rejected. Skipped and counted, not fatal.
+    /// Records `taxonomy::parse` rejected. Skipped and counted rather than
+    /// fatal: one stray record in 1.88 million should not cost the whole run.
     pub parse_failures: Vec<(u32, String)>,
 }
 
 impl Survey {
-    /// Records per order in genus-annotated lineages beneath it. Single source of
-    /// truth shared by the report and the shallow caps.
+    /// Records per order in genus-annotated lineages beneath it.
+    ///
+    /// The one place the annotation coverage of an order is decided. Both the
+    /// report and the shallow caps read it, and they must agree: the manifest
+    /// describes what the caps did, so a second, subtly different traversal
+    /// would make it describe something else.
     pub fn order_coverage(&self) -> std::collections::HashMap<u32, u64> {
         let mut coverage = std::collections::HashMap::new();
         for group in &self.groups {
@@ -172,7 +212,8 @@ impl Survey {
         }
         coverage
     }
-    /// Guard role this group plays, or `None` if it names a family or genus.
+    /// Which over-classification guard role this group plays, or `None` when it
+    /// names a family or a genus and so is not a guard at all.
     pub fn shallow_class(
         &self,
         group: &Group,
@@ -206,17 +247,23 @@ const ORDER: usize = 4;
 const FAMILY: usize = 5;
 const GENUS: usize = 6;
 
-/// Organellar and spike-in decoys are marked with a leading underscore on
-/// the domain (`_mitochondrion`, `_plastid`, ...), plus `Unispike*` controls.
+/// EUKARYOME marks organellar and spike-in decoys with a leading underscore on
+/// the domain (`_mitochondrion`, `_plastid`, `_Bacteria`, ...) plus the
+/// `Unispike*` synthetic controls.
 fn is_organellar(domain: &str) -> bool {
     domain.starts_with('_') || domain.starts_with("Unispike")
 }
 
-/// Pass 1: parse every record once and keep a fixed-size summary of each.
+/// Pass 1. Parses every record once and keeps a fixed-size summary of each.
 ///
-/// Policy-free, so one survey serves many policies ([`save`], [`load`]).
-/// `oversize` receives labels of records past its length threshold as they
-/// are seen, since summaries do not keep labels.
+/// Takes no policy: what it produces is measurements, so one survey serves any
+/// number of policies and can be cached across a sweep ([`save`], [`load`]).
+///
+/// `oversize` is the one exception, and it is why the threshold travels with the
+/// writer rather than being read from a policy: it receives the label of every
+/// record past that length, streamed as it is seen, because labels are the one
+/// thing a summary deliberately does not retain -- holding 1.55 million of them
+/// would cost more than the rest of the pass.
 pub fn survey(reference: &Path, mut oversize: Option<(usize, &mut dyn Write)>) -> Result<Survey> {
     let mut tree = TreeBuilder::default();
     let mut summaries: Vec<Summary> = Vec::new();
@@ -237,7 +284,8 @@ pub fn survey(reference: &Path, mut oversize: Option<(usize, &mut dyn Write)>) -
         let lineage = match taxonomy::parse(&label) {
             Ok(lineage) => lineage,
             Err(error) => {
-                // Bound what we keep so a badly broken file can't exhaust memory.
+                // Cap what we retain: a badly broken file should not be able to
+                // turn a diagnostic into an out-of-memory.
                 if parse_failures.len() < 64 {
                     parse_failures.push((ordinal, format!("{label:?}: {error}")));
                 }
@@ -249,7 +297,9 @@ pub fn survey(reference: &Path, mut oversize: Option<(usize, &mut dyn Write)>) -
         unknown_bases += unknown as u64;
         unknown_records += u64::from(unknown > 0);
         let words = sequence::unique_words(&seq);
-        // Any base outside ACGT breaks the k-mer window, not only unrecognised bytes.
+        // Ambiguity here means "carries no k-mer", which is every base outside
+        // ACGT -- not just the bytes `normalize` failed to recognise. An N-rich
+        // record breaks the window exactly as a `@` would.
         let ambiguous = seq
             .iter()
             .filter(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
@@ -298,8 +348,13 @@ pub fn survey(reference: &Path, mut oversize: Option<(usize, &mut dyn Write)>) -
     })
 }
 
-/// Node ID -> group index, and the groups themselves. Rank-6 nodes are exactly
-/// the distinct stored lineages. Rebuilt on cache load rather than stored.
+/// Node ID -> group index, and the groups themselves.
+///
+/// Every `TreeBuilder::insert` walks all seven ranks, so the rank-6 nodes are
+/// exactly the distinct stored lineages and no separate bookkeeping is needed.
+/// Split out of [`survey`] so a cache load reconstructs it rather than storing
+/// it: it is derivable from the tree and the summaries, and a stored copy is one
+/// more thing that could disagree with them.
 fn index_groups(tree: &TreeBuilder, summaries: &[Summary]) -> Result<(Vec<u32>, Vec<Group>)> {
     let mut index_of = vec![u32::MAX; tree.nodes.len()];
     let mut groups = Vec::new();
@@ -330,13 +385,20 @@ fn index_groups(tree: &TreeBuilder, summaries: &[Summary]) -> Result<(Vec<u32>, 
     Ok((index_of, groups))
 }
 
-// --- Survey cache: pass 1 is policy-free, so it can be reused ---
+// ---------------------------------------------------------------------------
+// Survey cache: pass 1 is policy-free, so a sweep need only pay for it once.
+// ---------------------------------------------------------------------------
 
 const CACHE_MAGIC: &[u8; 8] = b"STXSURV\0";
 
-/// Cache key: size and mtime of the input. Not a content hash, so an in-place
-/// rewrite with identical size and mtime goes unnoticed; [`emit`] re-checks
-/// the record count for that reason.
+/// What the cache is keyed on: if any of this differs, the cache describes a
+/// different file and must not be used.
+///
+/// Size and modification time rather than a content hash, because hashing the
+/// input would re-read the 1 Gbp the cache exists to avoid reading. The
+/// consequence is documented rather than hidden: a database rewritten in place
+/// to exactly the same size and timestamp would go undetected here -- which is
+/// why [`emit`] independently re-checks the record count it actually sees.
 fn source_key(reference: &Path) -> Result<(u64, i64, u32)> {
     let meta =
         std::fs::metadata(reference).with_context(|| format!("reading {}", reference.display()))?;
@@ -378,8 +440,8 @@ impl Cursor<'_> {
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
-    /// Length-prefixed UTF-8 string, bounded by the remaining input so a corrupt
-    /// length can't trigger a huge allocation.
+    /// A length-prefixed UTF-8 string. Bounded by the remaining input so a
+    /// corrupt length cannot ask for a multi-gigabyte allocation.
     fn string(&mut self) -> Result<String> {
         let len = self.u32()? as usize;
         ensure!(len <= self.bytes.len() - self.at, "truncated survey cache");
@@ -387,8 +449,11 @@ impl Cursor<'_> {
     }
 }
 
-/// Write a survey cache next to the database, atomically so an interrupted
-/// run can't leave a truncated cache behind.
+/// Serialize a survey next to the database it describes.
+///
+/// Written atomically, like every other artifact this tool publishes: a cache
+/// truncated by an interrupted run would otherwise be indistinguishable from a
+/// valid one until it produced a wrong database.
 pub fn save(survey: &Survey, reference: &Path, path: &Path) -> Result<()> {
     let (len, secs, nanos) = source_key(reference)?;
     let mut out = Vec::with_capacity(survey.summaries.len() * 110 + (1 << 16));
@@ -457,8 +522,12 @@ pub fn save(survey: &Survey, reference: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a survey cache, or `Ok(None)` if there is none at `path`. A cache for
-/// a different database or contract, or a damaged one, is an error.
+/// Read a survey back, or `Ok(None)` if there is no cache at `path` yet.
+///
+/// A cache that exists but describes a different database, or a different
+/// selection contract, or is damaged, is an **error** rather than a silent
+/// re-survey: it means the caller is pointing at the wrong file, and quietly
+/// doing the expensive thing would hide that until the results disagreed.
 pub fn load(reference: &Path, path: &Path) -> Result<Option<Survey>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -567,10 +636,15 @@ pub fn load(reference: &Path, path: &Path) -> Result<Option<Survey>> {
     }))
 }
 
-// --- Plan: what a policy would do, without writing anything ---
+// ---------------------------------------------------------------------------
+// Plan: what a policy would do, without writing anything.
+// ---------------------------------------------------------------------------
 
-/// Guard role of an under-annotated record. Capped rather than deleted, but
-/// over-weighted, since missing ranks share a single empty node per parent.
+/// Which guard role an under-annotated record plays. These are the SINTAX
+/// paper's Fig. 1 defence against over-classification, so they are capped
+/// rather than deleted -- but they are also structurally over-weighted, because
+/// `TreeBuilder` interns every missing rank under a parent as a *single* empty
+/// node while annotated siblings split their votes across many.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shallow {
     /// Order already has genus-annotated members: least informative.
@@ -592,11 +666,11 @@ pub struct Occupancy {
 
 pub struct Plan {
     pub cap: usize,
-    /// Hard length ceiling in force, so the hazard report can say whether the
-    /// records it describes were kept or dropped.
+    /// The hard ceiling in force, so the hazard report can say whether the
+    /// records it is describing were kept or dropped.
     pub max_length: Option<usize>,
-    /// Quantiles of within-lineage sketch distance over a bounded sample: all
-    /// members, then only members within the length threshold.
+    /// Quantiles of within-lineage sketch distance, over a bounded sample:
+    /// all members, then members within the length threshold only.
     pub diversity: Option<[f32; 5]>,
     pub diversity_trimmed: Option<[f32; 5]>,
     pub demote_length: u64,
@@ -650,20 +724,26 @@ fn percentiles(lengths: &mut [u32]) -> Percentiles {
     }
 }
 
-/// Cap values for the cap curve; extends past the default cap so the policy
-/// marker is shown.
+/// Cap curve x-axis. It runs past the default cap deliberately: a curve that
+/// stops below the policy in force cannot show what that policy costs, and the
+/// `<- policy` marker would never render.
 const CAPS: [usize; 13] = [1, 2, 3, 5, 10, 20, 25, 50, 100, 250, 500, 1000, 2500];
 
-/// Sampled distribution of sketch distances within the same stored lineage,
-/// used to calibrate [`DIVERSITY_CEILING`].
+/// How far apart two records of the *same* stored lineage typically are.
+///
+/// This is what calibrates [`DIVERSITY_CEILING`]: the ceiling has to sit above
+/// genuine within-lineage variation (so selection still rewards it) and below
+/// the distance to unrelated junk (so selection stops rewarding that). Sampled
+/// rather than exhaustive -- the full computation is quadratic in group size.
 fn diversity_probe(survey: &Survey, members: &[Vec<u32>]) -> Option<[f32; 5]> {
     let mut distances: Vec<f32> = Vec::new();
     for group in members {
         if group.len() < 2 {
             continue;
         }
-        // Pair each member with a partner halfway along the group so the sample
-        // spans it rather than clustering on adjacent records.
+        // Deterministic stride sampling: pair each member with a partner some
+        // way along the group, so the sample spans the group rather than
+        // clustering around adjacent input records.
         let stride = (group.len() / 2).max(1);
         for (offset, &i) in group.iter().enumerate().take(64) {
             let j = group[(offset + stride) % group.len()];
@@ -686,8 +766,9 @@ fn diversity_probe(survey: &Survey, members: &[Vec<u32>]) -> Option<[f32; 5]> {
     Some([at(0.05), at(0.25), at(0.50), at(0.75), at(0.95)])
 }
 
-/// Occupancy classes as a fraction of the 65,536-word universe. Expected
-/// spurious score is `SAMPLE_SIZE x occupancy`, i.e. out of 32.
+/// Occupancy classes, as a fraction of the 65,536-word universe. The expected
+/// score of an unrelated query against a reference is `SAMPLE_SIZE x occupancy`,
+/// so these are directly readable as "spurious score out of 32".
 const CLASSES: [(&str, f64); 5] = [
     (">=20%", 0.20),
     ("10-20%", 0.10),
@@ -697,7 +778,8 @@ const CLASSES: [(&str, f64); 5] = [
 ];
 
 pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
-    // Only the largest lineages matter here: those are the ones a cap bites into.
+    // Bound the probe to the largest lineages: they are the ones a cap actually
+    // bites into, so they are the ones whose internal diversity matters.
     let mut ranked: Vec<usize> = (0..survey.groups.len()).collect();
     ranked.sort_unstable_by_key(|&g| std::cmp::Reverse(survey.groups[g].records));
     ranked.truncate(500);
@@ -715,8 +797,10 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
     let mut probe: Vec<Vec<u32>> = probe.into_values().collect();
     probe.sort_unstable_by_key(|g| g.first().copied().unwrap_or(0));
     let diversity = diversity_probe(survey, &probe);
-    // Jaccard collapses when lengths differ wildly, so repeat the probe over
-    // length-typical members only; the gap shows the length hazard.
+    // Jaccard collapses when two records differ wildly in length -- a 32 kb
+    // untrimmed reference shares little with a 500 bp one no matter how close
+    // their taxonomy -- so the same probe is run again over length-typical
+    // members only. The gap between the two is the length hazard, measured.
     let trimmed: Vec<Vec<u32>> = probe
         .iter()
         .map(|g| {
@@ -804,9 +888,14 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
         })
         .collect();
 
-    // Exact duplicates, split by whether the copies agree on taxonomy. Agreeing
-    // ones can collapse; disagreeing ones are reported and left alone.
-    // Sorted runs instead of a hash map to keep allocations down.
+    // Exact duplicates, split by whether the copies agree on taxonomy. The
+    // agreeing ones are free to collapse; the disagreeing ones are exactly the
+    // records that make the uniform tie-break flip a genus by coin toss, so
+    // they are reported and never touched.
+    //
+    // Sorted runs rather than a hash map: one allocation instead of one per
+    // distinct sequence, which at 1.8 million records is the difference between
+    // a diagnostic and a memory problem.
     let mut keys: Vec<([u8; 16], u32, u32)> = survey
         .summaries
         .iter()
@@ -821,7 +910,7 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
             end += 1;
         }
         if end - run > 1 {
-            // Group IDs within a run are already sorted by the tuple sort.
+            // Within the run the group IDs are already sorted by the tuple sort.
             let distinct = 1
                 + (run + 1..end)
                     .filter(|&i| keys[i].2 != keys[i - 1].2)
@@ -833,8 +922,9 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
     }
     drop(keys);
 
-    // A length spike far above the rest points to upstream truncation, which
-    // curation cannot fix.
+    // A length spike far above the rest of the distribution is a truncation
+    // artifact upstream, not biology. Worth surfacing: it means the sequences
+    // themselves are wrong, which no amount of curation can fix.
     let truncation_artifact = truncation
         .into_iter()
         .max_by_key(|&(_, n)| n)
@@ -867,9 +957,12 @@ pub fn plan(survey: &Survey, policy: &Policy) -> Plan {
     }
 }
 
-// --- Reporting ---
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
 
-/// Formats a number with thousands separators.
+/// Thousands separators. Every number in this report is compared against a
+/// number a human worked out by hand, so readability beats brevity.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -891,8 +984,8 @@ fn percent(part: u64, whole: u64) -> f64 {
 }
 
 impl Plan {
-    /// Human-readable survey report, suitable for diffing between database
-    /// revisions.
+    /// The survey, as a human reads it. Written to stdout so it can be diffed
+    /// between database revisions.
     pub fn render(&self) -> String {
         let mut out = String::new();
         let p = &self.lengths;
@@ -973,10 +1066,17 @@ impl Plan {
         out
     }
 
-    /// Word-space saturation warning, or `None` when nothing is saturated.
+    /// The word-space saturation warning.
     ///
-    /// With `K = 8` a long reference contains a large share of all possible
-    /// words, so it scores well against any query and can win novel queries.
+    /// With `K = 8` there are only 65,536 possible words, so a long reference
+    /// holds a large fraction of every word that exists. Such a reference
+    /// scores highly against *any* query by chance -- SINTAX counts how many of
+    /// 32 sampled query words the reference contains, and containment is what
+    /// saturation buys. It can therefore win the top hit for a novel query
+    /// regardless of taxonomy, which is over-classification with a confident
+    /// label attached.
+    ///
+    /// Returns `None` when nothing is saturated.
     pub fn hazard(&self) -> Option<String> {
         self.hazard_with(None)
     }
@@ -1063,8 +1163,11 @@ impl Plan {
                 percent(after.organellar, after.records),
                 percent(self.organellar, self.parsed),
             ));
-            // Trigger on the organellar share too: thinning the rest concentrates the
-            // worst offenders even as the overall share drops.
+            // Trigger on the organellar share, not the overall saturating
+            // share: thinning the merely-long protist records pulls the
+            // aggregate down even as the worst offenders -- each alone in its
+            // own stored lineage -- are concentrated by exactly the amount the
+            // rest of the database shrank.
             let organellar_before = percent(self.organellar, self.parsed);
             let organellar_after = percent(after.organellar, after.records);
             if organellar_after > organellar_before * 1.2 || after_share > before_share * 1.2 {
@@ -1094,30 +1197,67 @@ impl Plan {
     }
 }
 
-// --- Selection ---
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
 
-/// How representatives are chosen. All but `Cover` act only on groups over
-/// the cap.
+/// How representatives are chosen. Every variant but `Cover` reduces a group
+/// only when it exceeds the cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Selector {
-    /// Keep one representative per LSH neighbourhood, densest first; `--cap` is a ceiling.
+    /// Keep as many representatives as the group's own diversity calls for.
+    ///
+    /// A count cap assumes every lineage of a given size is equally redundant,
+    /// and on EUKARYOME 2.2 that is badly wrong: covering *Penicillium* takes
+    /// 1,080 of its 21,755 members while Rozellomycota needs 7,130 of 11,215.
+    /// A cap of 100 keeps 9.3% of one lineage's distinct neighbourhoods and
+    /// 1.4% of the other's, which is where the sensitivity cliff comes from.
+    ///
+    /// So: walk the group densest-member-first and keep a record only when no
+    /// already-kept record shares an LSH band with it. Dense-first is the
+    /// lesson of the `maxmin` result -- farthest-point picks a lineage's
+    /// periphery and queries arrive from its bulk -- so this picks
+    /// neighbourhood centres and works outwards. `--cap` becomes a ceiling
+    /// rather than a target, and `--cover-bands` sets the radius.
     Cover,
-    /// Uniform random sample, seeded per group (default).
+    /// Uniform without replacement, seeded per group. The default, on measured
+    /// grounds: a uniform sample lands in each part of a lineage in proportion
+    /// to how much of the lineage is there, which is also where queries land.
     Random,
-    /// Farthest-point selection over k-mer sketches (favours the lineage periphery).
+    /// Farthest-point selection over k-mer sketches.
+    ///
+    /// The intuition -- keep the members that between them cover the most word
+    /// space -- is wrong here, and measurably so: it was the *worst* of the
+    /// three, 38.9% genus sensitivity against 47.9% for `random` at cap 25.
+    /// Farthest-point is a k-center objective, so it deliberately picks the
+    /// periphery of a lineage, while queries arrive from its bulk. Kept as a
+    /// validation arm and because the sketches it needs also produce the
+    /// within-lineage distance report that calibrates `--ceiling`.
     Maxmin,
-    /// Keep records in input order, like a naive `head -n` cap.
+    /// Input order: what a naive `head -n` cap would do. The null arm.
     First,
 }
 
 /// Distances above this are treated as equal.
 ///
-/// Stops farthest-point selection from favouring chimeras and misannotated
-/// records. Set just above typical within-lineage distances; `--ceiling 1.0`
-/// disables it and `--plan` prints the distribution to recalibrate.
+/// Plain farthest-point selection picks chimeras and misannotated records
+/// first, because they are by construction the farthest from everything.
+/// Truncating the objective makes "diverged beyond recognition" a plateau
+/// rather than a prize, and the density tie-break then prefers whichever
+/// candidate on that plateau actually has relatives.
+///
+/// Calibrated against the measured distribution, not guessed: on EUKARYOME ITS
+/// the within-lineage sketch distance runs p25 0.72, median 0.84, p75 0.94,
+/// p95 1.00. Congeneric ITS really does share few 8-mers -- a Jaccard of 0.16
+/// is about 79% nucleotide identity, since one mismatch destroys eight words --
+/// so a low ceiling would flatten genuine diversity rather than protect it.
+/// This sits just above the measured p75, which leaves the bulk of real
+/// variation ranked while denying "shares no words at all" the top prize.
+/// `--ceiling 1.0` disables truncation; `--plan` prints the distribution this
+/// was set from, so it can be re-derived for any other database.
 pub const DIVERSITY_CEILING: f32 = 0.95;
 
-/// LSH bands used for the density proxy, each covering `sketch::BAND` min-hashes.
+/// LSH bands used for the density proxy. Each covers `sketch::BAND` min-hashes.
 const DENSITY_BANDS: usize = 4;
 
 #[derive(Clone, Debug, Default)]
@@ -1129,10 +1269,11 @@ pub struct DropCounts {
     pub over_cap: u64,
     /// Trimmed by a shallow-record cap rather than the lineage cap.
     pub over_shallow_cap: u64,
-    /// Removed by a validation switch.
+    /// Removed by a validation arm.
     pub deliberate: u64,
-    /// Records reinstated because a filter would otherwise have emptied a stored
-    /// lineage. Nonzero means the policy was too aggressive somewhere.
+    /// Records reinstated because a filter would otherwise have emptied a
+    /// stored lineage. Small, and always worth reporting: a nonzero value means
+    /// the policy was too aggressive for some corner of the database.
     pub restored: u64,
 }
 
@@ -1141,8 +1282,9 @@ pub struct Selection {
     pub kept: u64,
     pub counts: DropCounts,
     pub policy_digest: [u8; 32],
-    /// Groups removed on purpose by a validation switch. Group preservation
-    /// still applies to everything else.
+    /// Groups removed on purpose by a validation arm. Group preservation does
+    /// not apply to these -- but it still applies to everything else, so an
+    /// arm cannot quietly take the rest of the database with it.
     pub deliberate: Vec<bool>,
 }
 
@@ -1156,8 +1298,11 @@ impl Selection {
     }
 }
 
-/// Candidate order within a group: not oversize, fewest ambiguous bases,
-/// length closest to the group median, then earliest.
+/// Ordering among candidates within a group: prefer a record that is not an
+/// oversize hazard, then one with few ambiguous bases, then one of typical
+/// length for its group, then the earliest. Length is compared to the group
+/// median rather than maximised, because the longest member of an untrimmed
+/// group is usually the one carrying the most non-ITS flank.
 fn preference(policy: &Policy, summary: &Summary, median_words: u32) -> (u8, u32, u32, u32) {
     (
         u8::from(policy.demoted(summary)),
@@ -1193,8 +1338,10 @@ pub fn policy_digest(policy: &Policy, selector: Selector, seed: u64) -> [u8; 32]
 
 /// Decide which records survive.
 ///
-/// Order matters: hard rejects before any cap slot is used, dereplication
-/// before selection, and group preservation last so no lineage vanishes.
+/// Ordering is load-bearing: hard rejects run before anything consumes a cap
+/// slot, so a junk record never displaces a good one; dereplication runs before
+/// selection, so representative slots are not spent on identical copies; and
+/// the group-preservation restore runs last, so no stored lineage can vanish.
 pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -> Selection {
     let n = survey.records as usize;
     let mut selection = Selection {
@@ -1205,8 +1352,9 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         deliberate: vec![false; survey.groups.len()],
     };
 
-    // Group membership in CSR layout: one allocation instead of one Vec per group.
-    // Counts come from `Group::records`.
+    // Group membership as a CSR layout: one allocation instead of 28,696 Vecs.
+    // The counting pass the prefix sum needs was already done by the survey and
+    // lives in `Group::records`.
     let groups = survey.groups.len();
     let mut offsets = vec![0u32; groups + 1];
     for (i, group) in survey.groups.iter().enumerate() {
@@ -1223,8 +1371,9 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         cursor[g] += 1;
     }
 
-    // Per-group caps. Under-annotated groups get a role-specific cap, so order
-    // annotation coverage must be known up front.
+    // Per-group caps. Annotated lineages get `policy.cap`; under-annotated ones
+    // get the role-specific cap, which is why the order's annotation coverage
+    // has to be known before any group is processed.
     let coverage = survey.order_coverage();
     let caps: Vec<usize> = survey
         .groups
@@ -1285,8 +1434,8 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
         });
         selection.counts.duplicates += (before - eligible.len()) as u64;
 
-        // (c) group preservation: every stored lineage in the input must appear in
-        // the output.
+        // (c) group preservation: a stored lineage present in the input must be
+        // present in the output, whatever the filters thought of its members.
         if eligible.is_empty() {
             let take = cap.min(dropped.len());
             let median = median_words(survey, &dropped);
@@ -1295,8 +1444,10 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
             });
             eligible.extend_from_slice(&dropped[..take]);
             selection.counts.restored += take as u64;
-            // Undo the drop counters for every reason a restored record was rejected,
-            // not just the first, so the manifest matches the written database.
+            // Undo the drop counters for every reason the restored records were
+            // rejected for, not just the first: a record can be both ambiguous
+            // and low-complexity, and counting it as dropped after reinstating
+            // it makes the manifest describe a database that was never written.
             for &i in &dropped[..take] {
                 let summary = &survey.summaries[i as usize];
                 let c = &mut selection.counts;
@@ -1312,8 +1463,12 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
             }
         }
 
-        // (d) reduce to representatives. `Cover` always runs, since how many a
-        // group needs depends on the group; the others only run over the cap.
+        // (d) reduce to representatives.
+        //
+        // `Cover` runs unconditionally: how many representatives a group needs
+        // is a property of the group, so it has work to do even when the group
+        // is already under cap. The count-based selectors only run when there
+        // is something to cut.
         let before = eligible.len();
         if selector == Selector::Cover {
             let median = median_words(survey, &eligible);
@@ -1330,8 +1485,11 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
                     });
                 }
                 Selector::Random => {
-                    // Seeded from the curation digest, not the clock or `rng::stream`, so the
-                    // same group always yields the same draw.
+                    // Deterministic in the database, not the clock: the same
+                    // group in the same file always yields the same draw.
+                    // Seeded from the curation digest rather than `rng::stream`,
+                    // which is domain-separated for the classifier and must not
+                    // be entangled with a database-side decision.
                     let mut rng = group_rng(&selection.policy_digest, g as u32);
                     for i in (1..eligible.len()).rev() {
                         eligible.swap(i, rng.bounded(i as u64 + 1) as usize);
@@ -1358,13 +1516,30 @@ pub fn select(survey: &Survey, policy: &Policy, selector: Selector, seed: u64) -
 
 /// LSH bands a full-width sketch affords.
 ///
-/// Two records share a band with probability `J^4`, so over `b` bands they
-/// match with `1 - (1 - J^4)^b`. More bands means a looser radius and more
-/// compression; four collapses pairs above about 0.8 Jaccard.
+/// Each band is `sketch::BAND` consecutive min-hashes, so two records share one
+/// only when all four agree -- probability `J^4` at Jaccard `J`. Over `b` bands
+/// the chance of matching somewhere is `1 - (1 - J^4)^b`, which is the radius
+/// [`Selector::Cover`] is really working at:
+///
+/// | J | b = 1 | b = 2 | b = 4 | b = 8 |
+/// |---|---:|---:|---:|---:|
+/// | 0.50 | 6% | 12% | 23% | 40% |
+/// | 0.70 | 24% | 42% | 66% | 89% |
+/// | 0.80 | 41% | 65% | 88% | 99% |
+/// | 0.90 | 66% | 88% | 99% | ~100% |
+///
+/// More bands means a looser radius and so more compression. Four is the
+/// default: it collapses records above roughly 80% Jaccard reliably and leaves
+/// anything below 70% largely alone, and within-lineage distance on this
+/// database has a median of 0.84, so most congeners never become candidates
+/// for collapsing at all.
 pub const BANDS: usize = SKETCH / sketch::BAND;
 
 /// Keep one representative per LSH neighbourhood, densest neighbourhood first.
-/// Runs regardless of cap; `cap` bounds it above, group preservation below.
+///
+/// Unlike every other selector this one runs whether or not the group is over
+/// cap, because its output size is a property of the group rather than of the
+/// policy. `cap` bounds it from above and group preservation from below.
 fn select_cover(survey: &Survey, policy: &Policy, members: &mut Vec<u32>, cap: usize, median: u32) {
     let bands = policy.cover_bands.clamp(1, BANDS);
     let density = density(survey, members);
@@ -1373,7 +1548,8 @@ fn select_cover(survey: &Survey, policy: &Policy, members: &mut Vec<u32>, cap: u
     order.sort_unstable_by_key(|&idx| {
         let summary = &survey.summaries[members[idx] as usize];
         (
-            // Oversize records are kept only if nothing better covers their neighbourhood.
+            // An oversize record represents nothing: it is kept only when
+            // nothing better covers its neighbourhood.
             u8::from(policy.demoted(summary)),
             std::cmp::Reverse(density[idx]),
             preference(policy, summary, median),
@@ -1384,8 +1560,10 @@ fn select_cover(survey: &Survey, policy: &Policy, members: &mut Vec<u32>, cap: u
     let mut kept = Vec::new();
     for idx in order {
         let sketch = survey.summaries[members[idx] as usize].sketch;
-        // Too few words to fill a band: keep it, since coverage can't be judged. Only
-        // happens for records restored by group preservation.
+        // Too few words to fill even one band: keep it rather than assume some
+        // neighbour speaks for it, because nothing here can tell whether one
+        // does. Only reachable for records reinstated by group preservation,
+        // since `min_words` otherwise guarantees a full-width sketch.
         let judgeable = sketch.band(0).is_some();
         let covered = judgeable
             && (0..bands).any(|b| sketch.band(b).is_some_and(|key| claimed[b].contains(&key)));
@@ -1406,8 +1584,12 @@ fn select_cover(survey: &Survey, policy: &Policy, members: &mut Vec<u32>, cap: u
     *members = kept;
 }
 
-/// Approximate number of close relatives per member, via LSH banding.
-/// Linear-time stand-in for neighbour counting.
+/// How many close relatives each member has, estimated by LSH banding.
+///
+/// Two records share a band key only when `sketch::BAND` consecutive min-hashes
+/// agree, which is the standard amplified test for "these are near-duplicates".
+/// Summing bucket co-occupancy over several bands gives an O(n) stand-in for
+/// counting neighbours, which would otherwise be the one quadratic step here.
 fn density(survey: &Survey, members: &[u32]) -> Vec<u32> {
     let mut density = vec![0u32; members.len()];
     let mut keys: Vec<(u64, u32)> = Vec::with_capacity(members.len());
@@ -1436,8 +1618,12 @@ fn density(survey: &Survey, members: &[u32]) -> Vec<u32> {
     density
 }
 
-/// Truncated greedy farthest-point selection, maximising retained k-mer
-/// coverage of the group.
+/// Truncated greedy farthest-point selection.
+///
+/// Maximising the minimum sketch distance among representatives maximises the
+/// group's retained k-mer coverage, which is exactly what decides whether a
+/// query's true genus still has a high-scoring member after curation -- SINTAX
+/// scores on word overlap, so coverage is the quantity that matters.
 fn select_maxmin(
     survey: &Survey,
     policy: &Policy,
@@ -1449,11 +1635,16 @@ fn select_maxmin(
     let density = density(survey, members);
     let sketch_of = |i: u32| survey.summaries[i as usize].sketch;
 
-    // Oversize records are picked only when nothing better is left; distance
-    // alone can't tell a divergent congener from junk.
+    // Oversize records outrank nothing. Measuring the distance distribution
+    // showed truncation cannot separate "genuinely divergent congener" from
+    // "junk": within-lineage distance saturates at 1.0 for both. So the guard
+    // that actually works is the one resting on a measured property -- an
+    // oversize reference is chosen only once nothing better is left, which is
+    // a lexicographic rule, not a threshold.
     let sound = |idx: usize| u8::from(!policy.demoted(&survey.summaries[members[idx] as usize]));
 
-    // Seed with a typical member: the first pick shapes everything after it.
+    // Seed with a typical member rather than a random or extreme one: the first
+    // pick has the most influence on everything that follows.
     let seed = (0..members.len())
         .max_by_key(|&idx| {
             let pref = preference(policy, &survey.summaries[members[idx] as usize], median);
@@ -1502,7 +1693,8 @@ fn select_maxmin(
         }
     }
 
-    // Emit in input order so the output reads as a subset of the original.
+    // Emit in input order: the curated FASTA should read like a subset of the
+    // original, not like a record of the order selection happened to visit.
     let mut kept: Vec<u32> = chosen.into_iter().map(|idx| members[idx]).collect();
     kept.sort_unstable_by_key(|&i| survey.summaries[i as usize].ordinal);
     *members = kept;
@@ -1530,9 +1722,12 @@ fn group_rng(policy: &[u8; 32], group: u32) -> crate::rng::Rng {
     ))
 }
 
-// --- Emit ---
+// ---------------------------------------------------------------------------
+// Emit
+// ---------------------------------------------------------------------------
 
-/// Post-condition of curation: nothing the database named can disappear.
+/// The post-condition that makes curation safe to validate against uncurated
+/// name counts: nothing the database *named* can disappear.
 #[derive(Debug)]
 pub struct Invariants {
     pub groups_preserved: bool,
@@ -1540,8 +1735,12 @@ pub struct Invariants {
     pub missing: Vec<String>,
 }
 
-/// Check group and name preservation from the selection alone. The first
-/// implies the second, but both are checked explicitly.
+/// Check group and name preservation from the selection alone.
+///
+/// Group preservation implies name preservation -- every group's path covers
+/// all of its ancestors, so keeping one record per group covers every node in
+/// the tree. Both are checked anyway: the point of an invariant is that the
+/// gate does not rest on the argument for it.
 pub fn invariants(survey: &Survey, selection: &Selection) -> Invariants {
     let mut group_kept = vec![false; survey.groups.len()];
     let mut node_kept = vec![false; survey.tree.nodes.len()];
@@ -1585,14 +1784,20 @@ pub fn invariants(survey: &Survey, selection: &Selection) -> Invariants {
             .iter()
             .enumerate()
             .all(|(g, &k)| k || selection.deliberate[g]),
-        // Validation switches remove names on purpose.
+        // A validation arm removes names on purpose; saying otherwise would
+        // make the flag unusable and the invariant meaningless.
         names_preserved: names_preserved || deliberate,
         missing,
     }
 }
 
-/// Saturation hazard in the curated database. Curation can raise the share
-/// of saturating decoys, since each sits alone in a lineage the cap never touches.
+/// Saturation hazard as it stands in a *curated* database.
+///
+/// Reported because curation can concentrate the hazard even while removing
+/// records: the worst attractors are multi-kilobase organellar decoys, and each
+/// sits in a stored lineage of its own, where a per-lineage cap never bites.
+/// Everything around them is thinned, so their share rises. Absolute risk is
+/// roughly unchanged; their odds of reaching the candidate set are not.
 pub struct HazardAfter {
     pub records: u64,
     pub saturating: u64,
@@ -1625,8 +1830,12 @@ pub struct Emitted {
     pub digest: blake3::Hash,
 }
 
-/// Pass 2: copy the selected records in input order. Sequences are written
-/// unwrapped, one line each.
+/// Pass 2: copy the selected records, in input order.
+///
+/// Sequences are written unwrapped -- one header line, one sequence line --
+/// rather than reproducing the input's line breaks. Nothing downstream can tell
+/// the difference (every consumer strips newlines before doing anything), and
+/// it keeps the writer a straight copy rather than a re-wrapper.
 pub fn emit(
     reference: &Path,
     output: &Path,
@@ -1667,8 +1876,10 @@ pub fn emit(
     }
     writer.flush()?;
     drop(writer);
-    // Check the total as well as the kept count: a stale --survey-cache can shift
-    // ordinals without changing how many records are kept.
+    // Both counts, not just the kept one. A stale --survey-cache misaligns the
+    // ordinal space without necessarily changing how many records are kept, so
+    // the total is the check that catches it; the kept count alone would let a
+    // wrong database be published under a right-looking manifest.
     ensure!(
         u64::from(ordinal) == surveyed,
         "reference holds {ordinal} records but the survey saw {surveyed}; \
@@ -1689,7 +1900,9 @@ pub fn emit(
     })
 }
 
-// --- Report ---
+// ---------------------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------------------
 
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -1713,8 +1926,8 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Provenance manifest written next to the curated FASTA: enough to reproduce
-/// it and to tell two curated databases apart.
+/// Provenance manifest. Everything needed to reproduce a curated database, and
+/// to tell two of them apart, in one file next to the FASTA.
 pub struct Provenance<'a> {
     pub plan: &'a Plan,
     pub policy: &'a Policy,

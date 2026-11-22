@@ -1,4 +1,5 @@
-//! Immutable, memory-mapped `.stx` index.
+//! Immutable, memory-mapped `.stx` index (format 5). See docs/INDEX_FORMAT.md
+//! for the byte-level contract.
 use crate::{ALGORITHM_VERSION, K, TILE, WORDS, input, sequence, taxonomy::TreeBuilder};
 use anyhow::{Context, Result, ensure};
 use memmap2::{Mmap, MmapMut};
@@ -10,29 +11,43 @@ use std::{
 };
 
 const HEADER: usize = 256;
-/// Word-directory record: offset, length, df, layout, distinct genera, distinct families.
+/// Word-directory record: offset, length, df, representation, then the two
+/// distinct-taxon counts added in format 3.
 const ENTRY: usize = 32;
 const NODE: usize = 24;
-/// Per-node aggregates: references, named children, genus-rank descendants (three u32).
+/// Per-node aggregates added in format 4: references, children, genus-rank
+/// descendants. Three u32 in the order a `protax` design row reads them.
 const NODE_STAT: usize = 12;
 const MAGIC: &[u8; 8] = b"SINTAXER";
 const FORMAT_VERSION: u32 = 5;
 
-// Header slots for the packed sequence sections.
+// Header slots for the v2 sequence sections, inside the range v1 reserved.
 const H_SEQ_DIR: usize = 160;
 const H_SEQ_PAYLOAD: usize = 168;
 const H_SEQ_LEN: usize = 176;
-// Header slots for the vocabulary and node-statistics sections.
+// Header slots for the v4 sections, in the range v1 through v3 reserved.
 const H_VOCAB: usize = 184;
 const H_NODE_STATS: usize = 192;
 /// Every k-mer of a packed record, in sequence order, duplicates included.
 ///
-/// Shared by [`Index::visit_kmers`] and [`Index::reference_words`]; an ambiguous
-/// base breaks the window. Words are read from 64-bit loads with bases reversed
-/// so the first base is in the top pair, giving each word as a single shift.
+/// The single implementation behind both [`Index::visit_kmers`] and
+/// [`Index::reference_words`], so the rule that an ambiguous base *breaks* the
+/// window rather than being skipped over -- which is what makes these agree
+/// with `sequence::unique_words` -- is written once.
+///
+/// The record is cut into runs of unambiguous bases, and each run's words are
+/// read straight out of 64-bit loads rather than rolled in one base at a time.
+/// Eight packed bytes hold 32 bases, low pair first; reversing the pairs of
+/// the whole `u64` puts the first base in the top pair, which is the order a
+/// word code keeps its bases in, so the word starting `p` bases into the load
+/// is simply `y >> (48 - 2p)`. One load yields up to 25 words, each for a
+/// shift and a truncation, where rolling cost a load-shift-mask-merge per base
+/// plus the loop around it (docs/RANK_round3.md §C). The previous version,
+/// kept as the test oracle, is `walk_kmers_scalar`.
 fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnMut(u16)) {
-    // Words per 64-bit load: up to `32 - K + 1`, rounded down to a multiple of four
-    // so the next load stays byte-aligned.
+    // Words per 64-bit load in the steady state. A load holds 32 bases, so up
+    // to `32 - K + 1` words; stopping at a multiple of four keeps the next
+    // load byte-aligned.
     const CHUNK: usize = (32 - K + 1) / 4 * 4;
     let mut breaks = ambiguous.chunks_exact(4).map(|b| u32_at(b, 0) as usize);
     let mut next_break = breaks.next().unwrap_or(usize::MAX);
@@ -46,18 +61,22 @@ fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnM
             let mut start = at;
             while start <= last {
                 let byte = start / 4;
-                // Shift each word into the top sixteen bits in turn.
+                // Shift each word into the top sixteen bits in turn: the only
+                // loop-carried work is one shift, where indexing by position
+                // chained a counter through every iteration.
                 let mut y = reversed_pairs(packed, byte);
                 if start % 4 == 0 && start + CHUNK <= last + 1 {
-                    // Common case, a whole chunk: constant trip count, so it unrolls.
+                    // The common case, a whole chunk: a constant trip count,
+                    // which unrolls and has no exit to mispredict.
                     for _ in 0..CHUNK {
                         visit((y >> (64 - 2 * K)) as u16);
                         y <<= 2;
                     }
                     start += CHUNK;
                 } else {
-                    // A run's first chunk (which realigns it) or its last: words starting
-                    // `first ..= stop` bases into the load.
+                    // A run's first chunk, which also realigns it, and its
+                    // last: words starting `first ..= stop` bases into the
+                    // load, all inside its 32 bases and inside the run.
                     let first = start % 4;
                     let stop = (last - byte * 4).min(CHUNK - 1);
                     y <<= 2 * first;
@@ -69,7 +88,7 @@ fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnM
                 }
             }
         }
-        // Step over the ambiguous base and start a fresh window.
+        // Step over the ambiguous base itself and start a fresh window.
         at = end + 1;
         next_break = breaks.next().unwrap_or(usize::MAX);
     }
@@ -77,7 +96,8 @@ fn walk_kmers(bases: usize, ambiguous: &[u8], packed: &[u8], mut visit: impl FnM
 
 /// The 32 bases packed from `byte` on, first base in the top pair.
 ///
-/// Bytes past the record read as zero; they only fill bases after the run's last word.
+/// Bytes past the end of the record read as zero. They can only fill bases
+/// after the run's last word, which no caller emits.
 #[inline(always)]
 fn reversed_pairs(packed: &[u8], byte: usize) -> u64 {
     let x = match packed.get(byte..byte + 8) {
@@ -119,8 +139,15 @@ fn align64(n: u64) -> u64 {
 
 /// Distinct genera and families containing each word, swept from the postings.
 ///
-/// Word-major order lets a per-node stamp array (holding the current word)
-/// deduplicate each incidence in O(1), with no set or sort.
+/// The counts a taxonomic IDF weight needs. Word-major is what makes the
+/// deduplication O(1) per incidence: within one word's posting list a stamp
+/// array keyed by node can carry that word's own index, so a genus already
+/// counted for this word is recognised without a set or a sort. Reference-major
+/// -- the order `verify` otherwise walks in -- would need the references sorted
+/// by genus first.
+///
+/// About one billion stamp comparisons on a 1.5-million-reference ITS
+/// database, against a ninety-second build.
 fn sweep_taxa(
     map: &[u8],
     references: usize,
@@ -130,8 +157,10 @@ fn sweep_taxa(
 ) -> (Vec<u32>, Vec<u32>) {
     let mut genera = vec![0u32; WORDS];
     let mut families = vec![0u32; WORDS];
-    // A missing rank is its own empty-named node, so these count taxon identities,
-    // not annotated names: a reference without a genus contributes its parent's sentinel.
+    // A missing rank is interned as its own empty-named node, so these count
+    // taxon identities rather than annotated names: a reference with no genus
+    // contributes its parent's sentinel. That is the right denominator for a
+    // weight, which is asking how many distinct lineages a word spans.
     let mut stamp_g = vec![u32::MAX; nodes];
     let mut stamp_f = vec![u32::MAX; nodes];
     let leaf = |reference: usize| u32_at(map, refs_offset + reference * 4);
@@ -191,10 +220,23 @@ fn sweep_taxa(
     (genera, families)
 }
 
-/// Per-node reference counts, named-child counts, and genus-rank descendant counts.
+/// Per-node reference counts, child counts, and genus-rank descendant counts.
 ///
-/// Computed in one reverse sweep, relying on `parent < node`. `references` counts
-/// every reference under a node, hit or not; the unnamed sentinel is not a child.
+/// All three roll up in one descending pass because the format guarantees
+/// `parent < node` for every non-root node, so a single reverse sweep sees each
+/// child before its parent. That is O(nodes), not O(references x ranks).
+///
+/// `references` must count every reference under the node, hit or not. PROTAX's
+/// `simMaxEml` counts non-hitting references deliberately -- it is what makes
+/// "many references, few hits" read as mislabelling evidence -- so reading the
+/// count off the candidate set instead would collapse the statistic. `genera`
+/// stands in for PROTAX's `log(prior)`, which counts described species under a
+/// node; genus is the deepest rank this format stores.
+///
+/// `children` counts only the **named** ones. The unnamed sentinel is not a
+/// taxon and must not be counted among "the children nothing matched", which
+/// is a claim about rival taxa. Counting it adds a phantom sibling to every
+/// under-annotated clade -- precisely where the number is doing the most work.
 struct NodeStats {
     references: Vec<u32>,
     children: Vec<u32>,
@@ -242,15 +284,17 @@ pub struct Index {
     validated: Vec<AtomicBool>,
 }
 
-/// How a word's posting row is stored; the builder picks the smallest.
+/// How a word's posting row is stored. The directory records it per word and
+/// the builder picks whichever is smallest; see `docs/INDEX_FORMAT.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// Strictly increasing `u32` reference ids. Smallest for rare words.
     Postings,
     /// One bit per reference, `ceil(N/8)` bytes. Smallest for common words.
     Bitmap,
-    /// Per tile, a `u16` count followed by that tile's ids as `u16` offsets
-    /// from the tile start. Smallest in between.
+    /// One `u16` count per tile followed by that tile's ids as `u16` offsets
+    /// from the tile start. Smallest in between, which on a production index is
+    /// most of the payload and nearly all of a query's vocabulary.
     Blocked,
 }
 
@@ -271,10 +315,13 @@ impl Layout {
             Self::Blocked => (references.div_ceil(TILE) as u64 + count as u64) * 2,
         }
     }
-    /// The smallest layout for a row.
+    /// The smallest layout for a row, which is how the builder chooses.
     fn best(references: usize, count: usize) -> Self {
-        // Keep the bitmap test independent of the blocked layout so the dense/sparse
-        // split doesn't shift. Blocked wins over postings above one posting per tile.
+        // The bitmap test is kept exactly as format 4 had it so that the
+        // dense/sparse split -- and with it the rank sweep's kernel mix and
+        // counter depth -- does not move as a side effect of adding a third
+        // layout. Blocked competes only with plain postings, and wins whenever
+        // a row averages more than one posting per tile.
         if Self::Bitmap.len(references, count) < Self::Postings.len(references, count) {
             Self::Bitmap
         } else if references.div_ceil(TILE) < count {
@@ -290,6 +337,21 @@ impl Layout {
             Self::Blocked => 2,
         }
     }
+}
+
+/// Where a word's row lies in the index and how it is stored: what
+/// [`Index::locate`] reads from the word directory and has validated. Not
+/// tied to the index's lifetime, so a caller that will visit the same rows
+/// again -- the replicates after the rank sweep -- can keep it and skip the
+/// directory, whose 2 MiB cost a cache miss per word. [`Index::row_at`] turns
+/// it back into a [`Row`]; handed a `RowRef` from another index it can only
+/// panic on the bounds or read the wrong bytes, never read out of bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRef {
+    offset: usize,
+    len: usize,
+    count: usize,
+    layout: Layout,
 }
 
 #[derive(Clone, Copy)]
@@ -322,7 +384,10 @@ impl Row<'_> {
     }
     /// Every reference id in `start .. end`, ascending.
     ///
-    /// Blocked rows have no tile directory, so a narrow range still walks from the start.
+    /// [`Layout::Blocked`] has no per-tile offset directory -- the rank sweep
+    /// visits every tile in order and so never needs one -- which means a
+    /// narrow range still walks the row from its start. Every caller asks for
+    /// the full range.
     pub fn visit(&self, start: usize, end: usize, mut f: impl FnMut(usize)) {
         match self.layout {
             Layout::Bitmap => {
@@ -370,10 +435,21 @@ impl Row<'_> {
             }
         }
     }
-    /// Add one to `counts[id - start]` for every posting of this sparse row inside
-    /// the tile `start .. start + counts.len()`.
+    /// Add one to `counts[id - start]` for every posting this **sparse** row
+    /// holds inside the tile `start .. start + counts.len()`.
     ///
-    /// `cursor` counts consumed postings and carries across calls with ascending `start`.
+    /// The rank pass used to force sparse rows through the same bit-sliced
+    /// kernel as dense ones: materialise a 64-lane bitmap, then ripple it into
+    /// the counter planes. For a row contributing a few dozen postings to a
+    /// 4096-reference tile that is almost all overhead -- a 512-byte clear and
+    /// a multi-plane carry propagation to record forty-odd increments. Adding
+    /// straight into the tile's count window is the same arithmetic with none
+    /// of the machinery, and because postings are sorted the writes stay inside
+    /// one 8 KiB L1-resident window.
+    ///
+    /// `cursor` counts postings consumed and carries across calls for ascending
+    /// `start`. Rows stored this way are rare in a query's vocabulary: the
+    /// builder blocks anything averaging more than one posting per tile.
     pub fn tile_increment(&self, start: usize, counts: &mut [u16], cursor: &mut usize) {
         debug_assert_eq!(self.layout, Layout::Postings);
         let end = start + counts.len();
@@ -383,7 +459,8 @@ impl Row<'_> {
         while i < self.count && self.id(i) < start {
             i += 1;
         }
-        // Slice once so the loop avoids a bounds check per posting.
+        // Slicing the remaining postings once lets the loop read them without
+        // a bounds check per posting.
         for posting in self.data[i * 4..self.count * 4].chunks_exact(4) {
             let id = u32::from_le_bytes(posting.try_into().unwrap()) as usize;
             if id >= end {
@@ -395,11 +472,27 @@ impl Row<'_> {
         *cursor = i;
     }
 
-    /// Add one to `counts[local]` for every posting in one blocked row's block
-    /// (`postings` excludes the count).
+    /// Add one to `counts[local]` for every posting of one **blocked** row's
+    /// block.
     ///
-    /// The mask is a no-op, since [`Index::row`] validated every offset, but it lets
-    /// the compiler drop the bounds check.
+    /// This is the tightest of the three kernels and the reason the layout
+    /// exists. A block is a `u16` count followed by that many `u16` offsets from
+    /// the tile's first reference, so the loop has a trip count known before it
+    /// starts, no comparison per posting, no subtraction to localise an id, and
+    /// half the bytes of a `u32` posting list. The `u32` version had to test
+    /// every posting against the tile's end because it could not know where the
+    /// tile stopped.
+    ///
+    /// `postings` is the block without its count. Blocks are emitted for every
+    /// tile including empty ones, so the rank sweep walks each row with a byte
+    /// cursor and no seeking; it reads the counts of all its rows in a pass of
+    /// their own before any of their postings (see `rank::sweep_tile`).
+    ///
+    /// The window is a whole tile even when the final tile is short, and the
+    /// offset is masked to it. [`Index::row`] has already checked every offset
+    /// against its tile, so the mask changes nothing; it is what tells the
+    /// compiler so, which removes a bounds check from every posting -- two of
+    /// the loop's seven instructions (docs/RANK_round3.md §B).
     #[inline(always)]
     pub fn block_increment(postings: &[u8], counts: &mut [u16; TILE]) {
         const { assert!(TILE.is_power_of_two()) };
@@ -409,10 +502,17 @@ impl Row<'_> {
         }
     }
 
-    /// Membership bits for a whole tile of a dense row, in one bulk read.
+    /// Membership bits for a whole tile of a **dense** row, in one bulk read.
     ///
-    /// `start` is tile-aligned, so the tile is one contiguous run of bytes; only
-    /// the final tile can be short.
+    /// A tile of a bitmap row is contiguous: `start` is always a multiple of
+    /// the rank pass's tile width, so `start / 8` is a multiple of 512 and the
+    /// whole tile is one aligned run of `out.len() * 8` bytes. Going through
+    /// `bits64` per lane instead cost a bounds computation and a `copy_from_slice`
+    /// -- which the release build emits as a real `memcpy` call -- 64 times per
+    /// row per tile. Every lane is assigned, so no pre-zeroing is needed either.
+    ///
+    /// Only the final tile of the final row can be short, and only there does
+    /// the tail path run.
     pub fn dense_tile(&self, start: usize, out: &mut [u64]) {
         debug_assert_eq!(self.layout, Layout::Bitmap);
         let off = start / 8;
@@ -440,19 +540,35 @@ impl Row<'_> {
         }
     }
 
-    /// Raw bytes of `lanes` lanes of a dense row from `start`, if the row holds
-    /// them all, for reading the bitmap in place.
+    /// The bytes of `lanes` lanes of a **dense** row from `start`, as far as
+    /// the row goes: whole lanes, except that in the database's final tile
+    /// the row can end inside its last lane. Kernels that read it zero-pad
+    /// what is missing, which is exactly what [`Row::dense_tile`] writes.
+    pub fn dense_bytes_upto(&self, start: usize, lanes: usize) -> &[u8] {
+        debug_assert_eq!(self.layout, Layout::Bitmap);
+        let data = self.data.get(start / 8..).unwrap_or_default();
+        &data[..data.len().min(lanes * 8)]
+    }
+
+    /// The raw bytes of `lanes` whole lanes of a **dense** row from `start`,
+    /// when the row holds them all -- every tile but a short final one -- for
+    /// kernels that read the bitmap in place instead of copying it out.
     pub fn dense_bytes(&self, start: usize, lanes: usize) -> Option<&[u8]> {
         debug_assert_eq!(self.layout, Layout::Bitmap);
         let off = start / 8;
         self.data.get(off..off + lanes * 8)
     }
 
-    /// Membership bits of one tile of this row, any layout: bit `i` of `out`
-    /// is reference `start + i`. `out` is overwritten in full.
+    /// Membership bits of one tile of this row, whatever its layout: bit `i`
+    /// of `out` is reference `start + i`.
     ///
-    /// Sparse rows advance `cursor`, so tiles must be visited in ascending
-    /// order, each once; skip unwanted ones with [`Row::skip_tile`].
+    /// Sparse rows carry `cursor` from tile to tile exactly as the rank
+    /// sweep's cursors do, so tiles must be visited in ascending order, each
+    /// once -- a tile not wanted goes through [`Row::skip_tile`] instead. `out`
+    /// is overwritten in full, including any lanes past the end of the
+    /// database, which come out zero. [`Index::row`] has already checked every
+    /// posting against its tile and the database size, so nothing written can
+    /// land past the tile's own lanes.
     pub fn tile_bits(&self, start: usize, cursor: &mut usize, out: &mut [u64]) {
         debug_assert!(start.is_multiple_of(TILE));
         match self.layout {
@@ -485,7 +601,9 @@ impl Row<'_> {
         }
     }
 
-    /// Advance a sparse row's cursor past the tile at `start` without reading it.
+    /// Advance a sparse row's cursor past the tile at `start` without reading
+    /// its postings: the counterpart of [`Row::tile_bits`] for a tile no
+    /// reference of which is wanted.
     pub fn skip_tile(&self, start: usize, cursor: &mut usize) {
         match self.layout {
             Layout::Bitmap => {}
@@ -502,8 +620,9 @@ impl Row<'_> {
         }
     }
 
-    /// Membership bits for 64 references of a bitmap row; `start` must be a
-    /// multiple of 64. Used by [`Row::visit`].
+    /// Membership bits for 64 references of a **bitmap** row; `start` must be a
+    /// multiple of 64. Only [`Row::visit`] needs this granularity -- the rank
+    /// sweep reads a whole tile at once through [`Row::dense_tile`].
     fn bits64(&self, start: usize) -> u64 {
         debug_assert_eq!(start % 64, 0);
         debug_assert_eq!(self.layout, Layout::Bitmap);
@@ -525,8 +644,8 @@ impl Index {
             file.metadata()?.len() >= HEADER as u64,
             "truncated index header"
         );
-        // SAFETY: read-only mapping. Published indexes are never modified in place;
-        // the builder replaces them atomically with a new inode.
+        // SAFETY: read-only mapping. Published indexes must never be truncated or
+        // modified in place; our builder uses atomic replacement of a new inode.
         #[expect(unsafe_code, reason = "read-only mapping; see SAFETY above")]
         let map = unsafe { Mmap::map(&file)? };
         ensure!(&map[..8] == MAGIC, "not a Sintaxer index");
@@ -694,16 +813,32 @@ impl Index {
         Ok(result)
     }
     pub fn row(&self, word: u16) -> Result<Row<'_>> {
+        Ok(self.row_at(self.locate(word)?))
+    }
+
+    /// The row a [`RowRef`] from [`Index::locate`] names: one bounds-checked
+    /// slice, no directory read and nothing to validate again.
+    pub fn row_at(&self, at: RowRef) -> Row<'_> {
+        Row {
+            data: &self.map[at.offset..at.offset + at.len],
+            layout: at.layout,
+            count: at.count,
+        }
+    }
+
+    /// [`Index::row`]'s directory read and first-touch validation, returning
+    /// where the row lies rather than the row itself; see [`RowRef`].
+    pub fn locate(&self, word: u16) -> Result<RowRef> {
         let p = HEADER + word as usize * ENTRY;
         let off = u64_at(&self.map, p) as usize;
         let len = u64_at(&self.map, p + 8) as usize;
         let row = Row {
             data: &self.map[off..off + len],
-            // `open` has already rejected unknown layout codes.
+            // `open` has already rejected any code outside the three layouts.
             layout: Layout::from_code(self.map[p + 20]).unwrap_or(Layout::Postings),
             count: u32_at(&self.map, p + 16) as usize,
         };
-        // Validate the payload once, lazily, before kernels use its IDs.
+        // Validate payload structure once, lazily, before kernels use IDs.
         if !self.validated[word as usize].load(Ordering::Acquire) {
             match row.layout {
                 Layout::Bitmap => {
@@ -730,8 +865,19 @@ impl Index {
                         prev = Some(id);
                     }
                 }
-                // The blocked kernel indexes the count window with stored offsets unchecked,
-                // so every offset must lie inside its tile (including the short final tile).
+                // The blocked kernel indexes the tile's count window directly
+                // with the stored offset and never compares it to anything, so
+                // every offset has to be inside its tile before a kernel runs.
+                // Checking the reconstructed id against `references` covers the
+                // final short tile as well.
+                //
+                // Offsets strictly increasing, with the last inside the tile,
+                // is the same condition as every offset being inside it. It is
+                // checked as a branch-free fold over neighbouring pairs rather
+                // than a comparison and a branch per posting: a row's first
+                // touch validates every posting it holds, and on a short
+                // EUKARYOME run the per-posting form was a seventh of all
+                // cycles.
                 Layout::Blocked => {
                     let tiles = self.references.div_ceil(TILE);
                     let (mut at, mut total) = (0usize, 0usize);
@@ -743,16 +889,19 @@ impl Index {
                             at + block * 2 <= row.data.len(),
                             "truncated block for word {word}"
                         );
-                        let mut prev = None;
-                        for local in row.data[at..at + block * 2].chunks_exact(2) {
-                            let local = u16::from_le_bytes(local.try_into().unwrap()) as usize;
+                        let (postings, _) = row.data[at..at + block * 2].as_chunks::<2>();
+                        if let Some(last) = postings.last() {
+                            let increasing = postings
+                                .iter()
+                                .zip(&postings[1..])
+                                .fold(true, |ok, (a, b)| {
+                                    ok & (u16::from_le_bytes(*a) < u16::from_le_bytes(*b))
+                                });
+                            let limit = TILE.min(self.references - tile * TILE);
                             ensure!(
-                                local < TILE
-                                    && tile * TILE + local < self.references
-                                    && prev.is_none_or(|v| local > v),
+                                increasing && usize::from(u16::from_le_bytes(*last)) < limit,
                                 "invalid posting for word {word}"
                             );
-                            prev = Some(local);
                         }
                         at += block * 2;
                         total += block;
@@ -765,12 +914,20 @@ impl Index {
             }
             self.validated[word as usize].store(true, Ordering::Release);
         }
-        Ok(row)
+        Ok(RowRef {
+            offset: off,
+            len,
+            count: row.count,
+            layout: row.layout,
+        })
     }
     /// Bounds-checked view of one reference's packed-sequence record.
     ///
-    /// Validated per access rather than at startup, so a run never faults in
-    /// directory pages it does not use.
+    /// Records are self-describing (base count, then ambiguous positions, then
+    /// two-bit bases) so the directory is one offset per reference. Validation
+    /// is per access rather than a startup sweep: the directory alone is 8 bytes
+    /// per reference, and touching all of it would fault in pages an ordinary
+    /// run never reads.
     fn record(&self, reference: usize) -> Result<(u32, &[u8], &[u8])> {
         ensure!(reference < self.references, "reference out of range");
         let dir = self.seq_dir + reference * 8;
@@ -798,7 +955,10 @@ impl Index {
 
     /// Every k-mer of one reference, in sequence order, duplicates included.
     ///
-    /// Not deduplicated: callers only set membership bits, which is idempotent.
+    /// Deduplicating would cost an 8 KiB bitset clear per reference, which at
+    /// a thousand candidates a query dominates everything else in the
+    /// projection. Callers that only set membership bits do not care: setting
+    /// the same bit twice is idempotent.
     pub fn visit_kmers(&self, reference: usize, visit: impl FnMut(u16)) -> Result<()> {
         let (bases, ambiguous, packed) = self.record(reference)?;
         walk_kmers(bases as usize, ambiguous, packed, visit);
@@ -807,8 +967,10 @@ impl Index {
 
     /// Distinct k-mers of one reference, in ascending order, via `visit`.
     ///
-    /// Matches `sequence::unique_words` exactly: an ambiguous base breaks the
-    /// window. `seen` is caller-owned scratch so repeated calls don't allocate.
+    /// This reproduces `sequence::unique_words` exactly, including the rule that
+    /// an ambiguous base breaks the window rather than being skipped over. The
+    /// scratch bitset is caller-owned so a scan over many candidates allocates
+    /// nothing.
     pub fn reference_words(
         &self,
         reference: usize,
@@ -838,8 +1000,11 @@ impl Index {
         for word in 0..WORDS {
             self.row(word as u16)?;
         }
-        // Check every sequence record, and that the forward profile agrees with the
-        // inverted index. Both come from the same extraction, so a mismatch means corruption.
+        // Every sequence record, and the agreement between the two
+        // representations of membership. The forward profile and the inverted
+        // index are written from the same extraction, so a disagreement means
+        // corruption rather than a logic error -- but it is exactly the kind of
+        // corruption a payload checksum would not localise.
         let mut seen = [0u64; WORDS / 64];
         let mut counts = vec![0u32; WORDS];
         for reference in 0..self.references {
@@ -859,7 +1024,8 @@ impl Index {
                 "sequence and posting sections disagree on word {word}"
             );
         }
-        // Recompute the taxon counts from the postings, just checked against the sequences.
+        // The taxon counts are recomputed from the postings, which the check
+        // above has just tied back to the packed sequences.
         let (genera, families) = sweep_taxa(
             &self.map,
             self.references,
@@ -874,8 +1040,9 @@ impl Index {
                 "directory and postings disagree on taxon counts for word {word}"
             );
         }
-        // The aggregates derive from already-checked leaves and parents, so a mismatch
-        // means the stored section is corrupt.
+        // The node aggregates roll up from the same leaf table and parent links
+        // `open` has already checked, so a disagreement here is corruption of
+        // the stored section rather than a tree that does not add up.
         let parents: Vec<u32> = (0..self.nodes).map(|n| self.parent(n as u32)).collect();
         let ranks: Vec<u8> = (0..self.nodes).map(|n| self.node_rank(n as u32)).collect();
         let named: Vec<bool> = (0..self.nodes)
@@ -901,15 +1068,19 @@ impl Index {
     pub fn format_version(&self) -> u32 {
         FORMAT_VERSION
     }
-    /// The algorithm version recorded in the file (not the binary's constant, so a
-    /// loader bug would show up here).
+    /// The algorithm version recorded in this file, which is not necessarily
+    /// the one this binary was compiled with -- `open` rejects a mismatch, so
+    /// they agree in practice, but reporting the binary's constant would hide a
+    /// loader bug rather than expose it.
     pub fn algorithm_version(&self) -> u32 {
         u32_at(&self.map, 12)
     }
     /// References carrying a name at each stored rank, `d` through `g`.
     ///
-    /// Makes a wrong rank separator visible: such a database builds fine but
-    /// parses as a single rank.
+    /// A reference database whose headers do not match the SINTAX `,` rank
+    /// separator parses as its first rank and nothing else, which is a silent
+    /// failure: the build succeeds and every call comes back at kingdom. This
+    /// census turns that into something visible at `index` and `inspect` time.
     pub fn rank_census(&self) -> [u64; 7] {
         let mut census = [0u64; 7];
         for reference in 0..self.references {
@@ -925,8 +1096,11 @@ impl Index {
     pub fn sequence_bytes(&self) -> usize {
         self.seq_len + (self.references + 1) * 8
     }
-    /// Rough mean bases per reference from the packed payload size. Only used
-    /// for cost estimates, never for scoring.
+    /// Mean bases per reference, estimated from the packed payload alone: each
+    /// record is an 8-byte header, its ambiguity list, and four bases a byte.
+    /// Ambiguity lists are ignored, so this errs high on messy databases. A
+    /// cost estimate for choosing between exact-equivalent strategies, never
+    /// an input to scoring.
     pub fn mean_bases(&self) -> usize {
         let packed = self.seq_len.saturating_sub(self.references * 8);
         (packed * 4).checked_div(self.references).unwrap_or(0)
@@ -942,13 +1116,18 @@ impl Index {
     }
     /// References containing `word`, read straight from the directory.
     ///
-    /// Avoids `row`, which would validate (and fault in) the word's payload.
+    /// Deliberately not `row(word)?.count`: `row` lazily validates a word's
+    /// payload the first time it is touched, and sweeping all 65,536 words
+    /// through it would fault in every posting row to build a 64 KiB table.
     pub fn document_frequency(&self, word: u16) -> u32 {
         u32_at(&self.map, HEADER + word as usize * ENTRY + 16)
     }
     /// Distinct genera containing `word`.
     ///
-    /// Unlike `df`, unaffected by duplicated records within a genus.
+    /// The weight source to prefer on a database whose copy numbers track
+    /// sequencing effort rather than biology: duplicating a genus's records
+    /// cannot change how many genera contain a word, so this is exactly
+    /// invariant to the redundancy `df` is fooled by.
     pub fn genus_frequency(&self, word: u16) -> u32 {
         u32_at(&self.map, HEADER + word as usize * ENTRY + 24)
     }
@@ -973,7 +1152,10 @@ impl Index {
     pub fn node_rank(&self, node: u32) -> u8 {
         self.map[self.nodes_offset + node as usize * NODE + 4]
     }
-    fn name_bytes(&self, node: u32) -> &[u8] {
+    /// A taxon's name as stored, without the UTF-8 check [`Index::name`]
+    /// repeats on every call. `open` has validated every name already, and
+    /// byte order is `str` order, so this is what comparisons should use.
+    pub fn name_bytes(&self, node: u32) -> &[u8] {
         let p = self.nodes_offset + node as usize * NODE;
         let off = self.strings_offset + u64_at(&self.map, p + 8) as usize;
         let len = u32_at(&self.map, p + 16) as usize;
@@ -984,7 +1166,14 @@ impl Index {
     }
     /// Distinct k-mers held by one reference, saturating at `u16::MAX`.
     ///
-    /// `vocabulary(r) / WORDS` is the chance a reference contains an arbitrary word.
+    /// The chance that a reference contains an arbitrary word is
+    /// `vocabulary(r) / WORDS`, which is what the `protax` scorer subtracts
+    /// before turning a containment into an identity estimate. A 12 kb protist
+    /// operon holds 27.9% of the whole 8-mer space and matches anything by
+    /// accident; this is the number that says so.
+    ///
+    /// Saturation is harmless because `WORDS` is 65,536 and a reference holding
+    /// every word would be indistinguishable from one holding all but one.
     pub fn vocabulary(&self, reference: usize) -> u32 {
         let p = self.vocab_offset + reference * 2;
         u32::from(u16::from_le_bytes(self.map[p..p + 2].try_into().unwrap()))
@@ -996,7 +1185,8 @@ impl Index {
             self.node_stats_offset + node as usize * NODE_STAT,
         )
     }
-    /// Immediate named children of `node`; the unnamed sentinel is not counted.
+    /// Immediate **named** children of `node`. A node's unnamed sentinel is
+    /// not counted: it records an absence of annotation, not a rival taxon.
     pub fn node_children(&self, node: u32) -> u32 {
         u32_at(
             &self.map,
@@ -1021,10 +1211,16 @@ impl Index {
     }
 }
 
-/// Maps a written lineage back to index nodes.
+/// Resolves a written lineage back to the nodes that store it.
 ///
-/// The index only stores parent links; training needs the downward lookup,
-/// so this is built only when requested.
+/// The index is an upward structure -- every node knows its parent, nothing
+/// knows its children -- because classification only ever walks from a matched
+/// reference toward the root. Training walks the other way: it needs the node
+/// a query's *own* annotation names, so that the design matrix is built under
+/// the true parent rather than under whichever parent the model preferred.
+///
+/// One pass over the node table, keyed the way `TreeBuilder` interns. Built
+/// only when a training flag asks for it; an ordinary run never pays for it.
 pub struct Locator {
     nodes: std::collections::HashMap<(u32, u8, Box<str>), u32>,
 }
@@ -1046,7 +1242,10 @@ impl Locator {
     }
     /// The node at each rank the lineage names, as far as the tree agrees.
     ///
-    /// Stops at the first rank not found under the already-resolved parent.
+    /// Stops at the first rank the index does not hold: a name that is not
+    /// under the parent the ranks above resolved to is not the same taxon,
+    /// whatever it is called elsewhere, and interning by `(parent, rank, name)`
+    /// is what makes that distinction real.
     pub fn locate(&self, lineage: &crate::taxonomy::Lineage) -> [Option<u32>; 7] {
         let mut out = [None; 7];
         let mut parent = 0u32;
@@ -1064,10 +1263,18 @@ impl Locator {
     }
 }
 
-/// Two-bit packs one normalized sequence into a self-describing record.
+/// Disk-backed staging keeps incidence lists out of the builder's heap.
+/// Temporary disk is about 6 bytes per (reference, distinct word) pair.
+/// Two-bit pack one normalized sequence into a self-describing record.
 ///
-/// Layout: base count, ambiguity count, ambiguous positions (ascending), then
-/// bases four per byte. Ambiguous bases are stored as A; they only break the k-mer window.
+/// Layout: base count, ambiguity count, the ambiguous positions ascending, then
+/// the bases four to a byte. Ambiguous bases are stored as A and listed, because
+/// what the kernel needs from them is only that they break the k-mer window --
+/// which is exactly what `sequence::unique_words` does with them.
+///
+/// Storing sequences rather than word lists costs roughly a fifth of the space
+/// (136 versus 700 bytes per reference on rdp_its) for comparable decode work,
+/// since probing the query lookup table dominates either way.
 fn pack_sequence(seq: &[u8]) -> Result<Vec<u8>> {
     let bases = u32::try_from(seq.len()).context("reference sequence too long")?;
     let mut ambiguous = Vec::new();
@@ -1112,7 +1319,8 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     }
     let mut counts = vec![0u32; WORDS];
     let (mut unknown_bases, mut unknown_records) = (0usize, 0usize);
-    // Packed sequences are staged to disk alongside the incidence buckets.
+    // Packed reference sequences are staged to disk alongside the incidence
+    // buckets so the builder never holds the whole database in memory.
     let mut sequences =
         BufWriter::with_capacity(1024 * 1024, File::create(tempdir.path().join("sequences"))?);
     let mut seq_offsets: Vec<u64> = vec![0];
@@ -1189,7 +1397,7 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
     }
     let mut out = tempfile::NamedTempFile::new_in(parent)?;
     out.as_file_mut().set_len(total)?;
-    // SAFETY: a freshly created private temporary file that we own exclusively.
+    // SAFETY: this newly created private temporary file is exclusively owned.
     #[expect(unsafe_code, reason = "exclusively owned temporary; see SAFETY above")]
     let mut map = unsafe { MmapMut::map_mut(out.as_file())? };
     map[..8].copy_from_slice(MAGIC);
@@ -1264,9 +1472,12 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
         drop(reader);
         std::fs::remove_file(path)?;
     }
-    // One streaming pass writes all layouts. The file is zero-filled, so empty tiles
-    // already have a zero count. `cursors`: next id offset; `blocks`: current tile's
-    // count offset; `tiles`: current tile index.
+    // One streaming pass writes all three layouts. Blocked rows need no
+    // counting pass first: the file is zero-filled, empty tiles therefore
+    // already carry a zero count, and because a word's postings arrive in
+    // ascending reference order the position of the next one is always known.
+    // `cursors` is the byte offset of the next id, `blocks` the offset of the
+    // count belonging to the tile being filled, and `tiles` that tile's index.
     let mut cursors = offsets.clone();
     let mut blocks = vec![0u64; WORDS];
     let mut tiles = vec![usize::MAX; WORDS];
@@ -1289,7 +1500,8 @@ pub fn build(reference: &Path, output: &Path) -> Result<()> {
                 Layout::Blocked => {
                     let tile = id / TILE;
                     if tiles[w] != tile {
-                        // Skip the (already zero) count slots of the empty tiles in between.
+                        // Skip the count slots of the tiles in between, which
+                        // are empty and already zero.
                         let skipped = tile.wrapping_sub(tiles[w].wrapping_add(1));
                         blocks[w] = cursors[w] + skipped as u64 * 2;
                         cursors[w] = blocks[w] + 2;

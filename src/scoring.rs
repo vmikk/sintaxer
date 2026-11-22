@@ -1,10 +1,11 @@
-//! Exact scan: every reference scored in every replicate.
+//! The exact scan, kept as the oracle the rank pass is checked against.
 //!
-//! Used by `--exact`, by tests, and as the fallback when candidate
-//! selection can't be trusted.
+//! This is published SINTAX: every reference scored in every replicate. It is
+//! what `--exact` runs, what the property tests compare against, and what the
+//! candidate path falls back to when its selection cannot be trusted.
 use crate::{
     SAMPLE_SIZE, TILE, bits,
-    index::{Index, Row},
+    index::{Index, Layout, Row, RowRef},
     weight,
 };
 use anyhow::{Result, ensure};
@@ -52,7 +53,7 @@ impl Top {
         }
         unreachable!()
     }
-    /// Build from a maximum and tie-set mask computed elsewhere.
+    /// Adopt a maximum and its tie-set mask computed elsewhere.
     pub fn from_bits(score: u8, bits: Vec<u64>) -> Self {
         let count = bits.iter().map(|w| w.count_ones() as usize).sum();
         Self { score, count, bits }
@@ -71,7 +72,7 @@ impl Top {
     }
 }
 
-/// Brute-force reference implementation for tests and diagnostics.
+/// Independent brute-force oracle for tests and small diagnostics.
 pub fn oracle_scores(
     reference_words: &[Vec<u16>],
     sample: &Sample,
@@ -89,14 +90,17 @@ pub fn oracle_scores(
         .collect()
 }
 
-/// Which references may win a replicate, and what its tie mask is over.
+/// Which references a replicate may be won by, and so what its tie mask is
+/// written over.
 #[derive(Clone, Copy)]
 pub enum Eligible<'a> {
     /// Every reference: the published algorithm. Tie bits are reference ids.
     All,
-    /// Only the candidates set in `mask`. Tie bits are candidate positions,
-    /// as [`crate::rank::Workspace::replicate`] reports them. `below[l]` is how
-    /// many candidates precede lane `l`.
+    /// Only the references whose bit is set in `mask`, one bit per reference
+    /// over the whole database: a candidate set. Tie bits are candidate
+    /// *positions* -- bit `k` is the `k`-th set bit of `mask` -- which is
+    /// exactly what [`crate::rank::Workspace::replicate`] reports, so the two
+    /// are interchangeable. `below[l]` is how many candidates precede lane `l`.
     Candidates { mask: &'a [u64], below: &'a [u32] },
 }
 
@@ -116,18 +120,33 @@ pub struct Engine {
     best: Vec<u64>,
     /// Each replicate's draws as matrix rows.
     draws: Vec<[u32; SAMPLE_SIZE]>,
-    /// Per matrix row, the last replicate that listed it: dedups draws without clearing.
+    /// Per matrix row, the last replicate that listed it among its distinct
+    /// draws: a generation stamp, so deduplicating a replicate costs a pass
+    /// over its 32 draws and no clearing.
     listed: Vec<u32>,
-    /// Per replicate, the range of its tie mask written so far.
+    /// Per replicate, its distinct rows with the rarest first, and how many:
+    /// the order an intersection consumes them in, which is the same in every
+    /// tile. Built the first time the replicate attempts one.
+    distinct: Vec<([u32; SAMPLE_SIZE], u8)>,
+
+    /// Per replicate, the range of its tie mask written so far, so that a new
+    /// maximum clears only that and not the whole database's worth of bits.
     written: Vec<(usize, usize)>,
 }
 
 const UNDRAWN: u32 = u32::MAX;
+/// A replicate whose distinct rows have not been listed yet.
+const UNLISTED: u8 = u8::MAX;
+/// Most draws per distinct row at which a saturated strand still reads its
+/// bitmap rows in place rather than from a copy; see [`bitsliced_tops`].
+const IN_PLACE_REUSE: usize = 4;
 
 /// Fold one tile's maximum and tie mask into a replicate's running [`Top`].
 ///
-/// Same rule as [`Top::from_scores`]: a lower maximum is ignored, a higher
-/// one replaces everything so far, an equal one adds its ties.
+/// The same rule [`Top::from_scores`] merges blocks by: a lower maximum is
+/// ignored, a higher one replaces everything so far, an equal one adds its
+/// ties. Tiles never overlap, so adding a tile's ties is an OR into bits no
+/// earlier tile wrote.
 fn merge_tile(
     top: &mut Top,
     written: &mut (usize, usize),
@@ -157,7 +176,9 @@ fn merge_tile(
             *written = (written.0.min(base), written.1.max(base + ties.len()));
         }
         Eligible::Candidates { mask, below } => {
-            // Ties are few, so place them one by one.
+            // Ties are few -- a handful per replicate, all of the candidates
+            // only when nothing scores at all -- so placing them one by one
+            // costs less than any compaction of whole lanes would.
             for (offset, &word) in ties.iter().enumerate() {
                 let lane = base + offset;
                 let mut rest = word;
@@ -178,23 +199,43 @@ fn merge_tile(
     top.count += count;
 }
 
-/// Every replicate's maximum and full tie set, bit-sliced. Same result as
-/// [`scalar_scores`] + [`Top::from_scores`].
+/// Every replicate's maximum and complete tie set, bit-sliced: the published
+/// all-reference scan, and [`scalar_scores`] + [`Top::from_scores`] exactly.
 ///
-/// `samples` are positions into `words`. The database is walked in tiles of
-/// [`crate::TILE`] references; per tile the drawn rows are materialised once
-/// as bitmaps, then each replicate counts its 32 rows through
-/// [`crate::bits`] and merges the tile result into its [`Top`].
+/// `samples` are positions into `words`, as the rest of the classifier
+/// draws them. The database is walked in tiles of [`crate::TILE`]
+/// references, the boundary the index's blocked rows are cut on. For each
+/// tile the drawn words' rows are materialised once as bitmaps -- dense rows
+/// copied, sparse ones set from their postings -- and then every replicate
+/// counts its 32 rows through the carry-save network in [`crate::bits`], so
+/// the database is read once per query-strand instead of once per
+/// replicate. The tile's maximum and tie mask are merged into that
+/// replicate's [`Top`] with the same rule `from_scores` merges blocks by, so
+/// the result is identical to the scalar scan, bit for bit, including the
+/// all-zero replicate whose tie set is every eligible reference.
 ///
-/// If some reference has every draw, the winners are exactly the AND of the
-/// drawn rows, which is much cheaper than counting. That is tried first
-/// while it keeps succeeding.
+/// A replicate some reference scores perfectly on -- every draw present --
+/// has that reference among its winners, and the winners are then exactly the
+/// intersection of the drawn rows. That intersection is far cheaper than
+/// counting, so it is tried first while it keeps succeeding: on close
+/// matches it nearly always does, and on novel queries a couple of misses
+/// switch it off. Either way the answer is the same.
 ///
-/// With [`Eligible::Candidates`], tiles without a candidate are skipped and
-/// ties are over candidate positions.
+/// With [`Eligible::Candidates`] only the candidates can win or tie, tiles
+/// without one are skipped outright, and ties are reported over candidate
+/// positions: the same `Top`, bit for bit, that projecting the candidates and
+/// running [`crate::rank::Workspace::replicate`] produces.
 ///
-/// `saturated`: some eligible reference holds every word of `words`, so
-/// every replicate is perfect and nothing needs counting. `false` is always safe.
+/// `saturated` says that some eligible reference holds every word of
+/// `words`. That reference then holds every draw of every replicate, so each
+/// replicate's maximum is its ceiling and its ties are exactly the
+/// intersection of its rows: no replicate needs counting at all. The caller
+/// knows this for free from the rank pass; passing `false` is always safe.
+///
+/// `known`, when given, is where each word of `words` has its row, from the
+/// rank sweep that has just read the same directory entries
+/// ([`crate::rank::Workspace::row_refs`]); without it they are looked up.
+#[allow(clippy::too_many_arguments)]
 pub fn bitsliced_tops(
     index: &Index,
     words: &[u16],
@@ -202,6 +243,7 @@ pub fn bitsliced_tops(
     weights: &weight::Table,
     eligible: Eligible<'_>,
     saturated: bool,
+    known: Option<&[RowRef]>,
     ws: &mut Engine,
 ) -> Result<Vec<Top>> {
     let n = index.references;
@@ -212,7 +254,8 @@ pub fn bitsliced_tops(
                 mask.len() == n.div_ceil(64) && below.len() == mask.len() + 1,
                 "candidate mask does not cover the database"
             );
-            // Tie masks are never empty vectors.
+            // As wide as the candidate path's own tie masks, which are never
+            // empty vectors.
             (below[mask.len()] as usize).max(1)
         }
     };
@@ -220,7 +263,8 @@ pub fn bitsliced_tops(
     ws.written.clear();
     ws.written.resize(samples.len(), (usize::MAX, 0));
 
-    // One matrix row per distinct drawn position, ascending.
+    // One matrix row per distinct drawn position, in ascending position
+    // order: which rows exist, and in what order, cannot affect a count.
     ws.slot.clear();
     ws.slot.resize(words.len(), UNDRAWN);
     for sample in samples {
@@ -239,10 +283,19 @@ pub fn bitsliced_tops(
             ws.drawn.push(position as u16);
         }
     }
+    if let Some(known) = known {
+        ensure!(
+            known.len() == words.len(),
+            "row references do not cover the query vocabulary"
+        );
+    }
     let rows: Vec<Row<'_>> = ws
         .drawn
         .iter()
-        .map(|&position| index.row(words[position as usize]))
+        .map(|&position| match known {
+            Some(known) => Ok(index.row_at(known[position as usize])),
+            None => index.row(words[position as usize]),
+        })
         .collect::<Result<_>>()?;
     let shifts: Vec<u8> = ws
         .drawn
@@ -271,8 +324,19 @@ pub fn bitsliced_tops(
     }
     ws.listed.clear();
     ws.listed.resize(rows.len(), u32::MAX);
+    ws.distinct.clear();
+    ws.distinct
+        .resize(samples.len(), ([0; SAMPLE_SIZE], UNLISTED));
     let mut perfect = vec![saturated; samples.len()];
     let (mut tried, mut hits) = (0usize, 0usize);
+    // A saturated strand answers every replicate by intersection and never
+    // counts, so its bitmap rows need not be copied into the matrix at all:
+    // the intersections read them where they lie in the index. That saves a
+    // copy of every bitmap row in every tile, which on a full-length 16S
+    // self-test was an eighth of all cycles. It pays while a row is ANDed only
+    // a few times; with many draws per row -- short amplicons, small
+    // vocabularies -- the copy is the cheaper thing to read over and over.
+    let in_place = saturated && rows.len() * IN_PLACE_REUSE >= samples.len() * SAMPLE_SIZE;
 
     ws.cursors.clear();
     ws.cursors.resize(rows.len(), 0);
@@ -304,17 +368,24 @@ pub fn bitsliced_tops(
             continue;
         }
 
-        // Every lane is written below, so the matrix is never cleared.
+        // Every lane of every row it needs is written below, so the matrix is
+        // only ever grown, never cleared.
         if ws.matrix.len() < rows.len() * stride {
             ws.matrix.resize(rows.len() * stride, 0);
         }
-        ws.listed.fill(u32::MAX);
         for ((row, cursor), out) in rows
             .iter()
             .zip(&mut ws.cursors)
             .zip(ws.matrix.chunks_exact_mut(stride))
         {
-            row.tile_bits(start, cursor, out);
+            // Bitmap rows keep no cursor, so leaving one out of the matrix
+            // costs nothing to catch up on in the next tile.
+            if !(in_place
+                && row.layout == Layout::Bitmap
+                && row.dense_bytes(start, lanes).is_some())
+            {
+                row.tile_bits(start, cursor, out);
+            }
         }
         ws.planes.resize(depth * stride, 0);
         ws.best.resize(stride, 0);
@@ -323,35 +394,53 @@ pub fn bitsliced_tops(
             let ceiling = ceilings[b];
             let written = &mut ws.written[b];
             if perfect[b] || tried < 4 || hits * 4 >= tried {
-                // Distinct draws, rarest row first so a miss stops early.
-                let mut offsets = [0usize; SAMPLE_SIZE];
-                let mut len = 0;
-                for &slot in &ws.draws[b] {
-                    let stamp = &mut ws.listed[slot as usize];
-                    if *stamp != b as u32 {
-                        *stamp = b as u32;
-                        offsets[len] = slot as usize;
-                        len += 1;
+                // The distinct draws, the rarest row first: an intersection
+                // that is going to come up empty usually does so on its
+                // rarest row, and then the scan stops there. The list is the
+                // same in every tile, so it is built once per replicate.
+                if ws.distinct[b].1 == UNLISTED {
+                    let mut distinct = [0u32; SAMPLE_SIZE];
+                    let mut len = 0;
+                    for &slot in &ws.draws[b] {
+                        let stamp = &mut ws.listed[slot as usize];
+                        if *stamp != b as u32 {
+                            *stamp = b as u32;
+                            distinct[len] = slot;
+                            len += 1;
+                        }
                     }
+                    let rarest = (0..len)
+                        .min_by_key(|&i| rows[distinct[i] as usize].count)
+                        .unwrap_or(0);
+                    distinct.swap(0, rarest);
+                    ws.distinct[b] = (distinct, len as u8);
                 }
-                let rarest = (0..len)
-                    .min_by_key(|&i| rows[offsets[i]].count)
-                    .unwrap_or(0);
-                offsets.swap(0, rarest);
-                for offset in &mut offsets[..len] {
-                    *offset *= stride;
-                }
-                let len = len as u8;
                 if !perfect[b] {
                     tried += 1;
                 }
-                if bits::intersect(
-                    &ws.matrix,
-                    &offsets[..len as usize],
-                    lanes,
-                    &ws.valid,
-                    &mut ws.best,
-                ) {
+                let (distinct, len) = ws.distinct[b];
+                let best = &mut ws.best[..lanes];
+                best.copy_from_slice(&ws.valid[..lanes]);
+                let mut whole = true;
+                for &slot in &distinct[..len as usize] {
+                    let row = &rows[slot as usize];
+                    let bytes = if in_place && row.layout == Layout::Bitmap {
+                        row.dense_bytes(start, lanes)
+                    } else {
+                        None
+                    };
+                    let any = match bytes {
+                        Some(bytes) => bits::and_bytes(best, bytes),
+                        None => {
+                            bits::and_lanes(best, &ws.matrix[slot as usize * stride..][..lanes])
+                        }
+                    };
+                    if !any {
+                        whole = false;
+                        break;
+                    }
+                }
+                if whole {
                     if !perfect[b] {
                         hits += 1;
                     }
@@ -359,11 +448,13 @@ pub fn bitsliced_tops(
                     merge_tile(top, written, ceiling, base, &ws.best[..lanes], eligible);
                     continue;
                 }
-                // An earlier tile reached the ceiling and this one can't.
+                // Some earlier tile already reached the ceiling, and nothing
+                // here does, so nothing here can win or tie.
                 if perfect[b] {
                     continue;
                 }
             }
+            debug_assert!(!in_place, "a saturated strand never counts");
             let offsets: [usize; SAMPLE_SIZE] =
                 std::array::from_fn(|i| ws.draws[b][i] as usize * stride);
             if weighted {
@@ -401,7 +492,8 @@ pub fn scalar_scores(
     scores.resize(index.references, 0);
     scores.fill(0);
     for &word in sample {
-        // `SAMPLE_SIZE * MAX_WEIGHT` is 128, so a u8 counter can't overflow.
+        // `SAMPLE_SIZE * MAX_WEIGHT` is 128, so a u8 counter still cannot
+        // overflow even when every draw lands on a maximally weighted word.
         let w = weights.get(word);
         index
             .row(word)?
